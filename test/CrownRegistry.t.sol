@@ -418,6 +418,7 @@ contract CrownRegistryTest is Test {
     /// @dev Conservation of funds under arbitrary stakes: the contract never owes more than it
     /// holds, and the difference is only rounding dust (under one wei per stake share), which
     /// stays in the contract.
+    /// forge-config: default.fuzz.runs = 1000
     function testFuzz_conservation(uint96 kA, uint96 kB, uint96 cA, uint96 cB) public {
         kA = uint96(bound(kA, 0, 5 ether));
         kB = uint96(bound(kB, 0, 5 ether));
