@@ -1,0 +1,30 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "CrownHook",
+    "constructorArgs": [
+      "$poolManager",
+      "$owner"
+    ],
+    "permissions": [
+      "afterInitialize",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "token": {
+    "contract": "CrownToken",
+    "name": "Crown Demo",
+    "symbol": "CRWN",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "Setup required: CrownHook starts without a registry or a ticker binding, so swaps pay no crown cut until the owner configures both. A separately deployed CrownRegistry (also exposed as ThroneRegistry) takes genesis arguments CRWN, the deployed CrownToken, and the launch beneficiary represented by $owner. Its address is supplied through the owner's one-time setRegistry call, not a hook constructor argument. After pool initialization, the owner calls registerPool with the ETH/CrownToken/12500/60/CrownHook PoolKey, keccak256(\"CRWN\"), and 100 bps; each pool's ticker and cut are then immutable, with a permitted cut range of 0-500 bps. afterInitialize records initialization, while registerPool binds the ticker. All enabled callbacks require the PoolManager. CrownHook accepts the listed 12500 LP fee, which is separate from its crown cut. The target is Robinhood Chain (4663); the deployment policy derives the opening price, while initialPrice records the supplied launch reference. CrownHook pays native ETH directly from PoolManager to the current king's beneficiary inside the swap and increments crownPaid only after a successful payment. beforeSwap and its return delta handle ETH-specified swaps; afterSwap and its return delta handle token-specified swaps. A reverting rehearsal measures partial fills. Missing configuration, failed or malformed registry reads, an absent beneficiary, insufficient manager ETH, or a failed payout skip the cut. A fresh tokens-only manager can therefore execute its first buy without a cut. No hook fee is held or deferred as a claim. CrownRegistry has no admin: a 0.01 ETH bond counts as challenger stake, a king has a seven-day minimum reign, staking lasts 72 hours, and finalization follows a 24-hour timelock. A challenger wins only with strictly more stake and at least 0.05 ETH total quorum; failure starts a three-day ticker cooldown. The challenge opener becomes the new beneficiary. Losing stake is 80% refundable; the 20% slash is split between winner bonuses and treasury 0xf19f11dee16a341671e6ed3e209b704c1bbc3e57. Winners recover their stakes plus pro-rata bonuses through pull claims; treasury withdrawal is permissionless. Integer rounding leaves bounded dust; an empty winning side sends the whole slash to treasury. The repository includes CrownChallengerToken, a distinct plain Crown Demo/CRWN ERC-20, its deployment helper in script/DeployCrown.s.sol, the ticker frontend in web/, and a local buy-challenge-stake-finalize-buy integration test verifying the recipient flip and crownPaid. The frontend needs actual deployment data before enabling contract actions. This manifest describes the accepted sources and does not deploy the registry or challenger, perform owner setup, or establish a live-chain demo. README compiler settings: Solidity 0.8.26, Cancun, optimizer enabled with 44444 runs, via_ir false, bytecode_hash none."
+}
