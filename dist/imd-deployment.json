@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "chainId": 4663,
+  "contracts": [],
+  "assets": [
+    {
+      "path": "NOTICE.txt",
+      "sha256": "babe22dcc3d423319fea56f1f462d0e5625bb40391c0eb02fe4f33246961dab2"
+    },
+    {
+      "path": "abi/CrownChallengerToken.json",
+      "sha256": "cee80b68734259b1c20375d6df78842e789b6285e39d5ec9386e80851d59ab4b"
+    },
+    {
+      "path": "abi/CrownHook.json",
+      "sha256": "3f4fcbf31f8f8585e9ba4f9ddd1b4b940ac84630b1e9ecbd54bda876ccde6382"
+    },
+    {
+      "path": "abi/CrownRegistry.json",
+      "sha256": "4c7dd02ab7e85a26ddefe449c519565e9375b19c71c59e3adcc742a72393a26d"
+    },
+    {
+      "path": "abi/CrownToken.json",
+      "sha256": "fa18836656eb1ae9982431486552b11430fae5062204768f343a6f2792ca46ce"
+    },
+    {
+      "path": "abi/ThroneRegistry.json",
+      "sha256": "4c7dd02ab7e85a26ddefe449c519565e9375b19c71c59e3adcc742a72393a26d"
+    },
+    {
+      "path": "assets/ccip-Cp0_HofE.js",
+      "sha256": "791ca977a4e33c2c8e0ccc8542cb5e92cae520af296fb896a677c35139fedf7c"
+    },
+    {
+      "path": "assets/hooks.module-DE9oX6xH.js",
+      "sha256": "18290b66f5736ddfcd375526f88fd55c2ecf072d6feee11d3554a78df4a3594f"
+    },
+    {
+      "path": "assets/index-C2Wbb7G-.css",
+      "sha256": "47a6a070693051fa5bc190ca5013db788ef4edb3b1fdc2d25a0aef3894f31b8d"
+    },
+    {
+      "path": "assets/index-NlUkNkPb.js",
+      "sha256": "744804dcb0e9db30922766cda121c37322fe013b27375b35ace89716020bb8fc"
+    },
+    {
+      "path": "assets/index-i5OnzwSe.js",
+      "sha256": "d79ca3ccd293f236e7cf4c583741318572cf3e0dbc7985a986e69d6e8bde7bb0"
+    },
+    {
+      "path": "assets/index-iLYAXTGY.js",
+      "sha256": "2502ce9c13f95265190f6bb995209544ee1cbcc27f03a27d4a522d2e35a87adb"
+    },
+    {
+      "path": "favicon.svg",
+      "sha256": "a27714dc17e0cc3ceafdc4477b596cc77d7e576c0fcc7e62b3f1ab6bed5ffec0"
+    },
+    {
+      "path": "index.html",
+      "sha256": "3033e350f4ac7222c0a0e3720f5ef9cc818383cbf97fbab7e413f049612e0c8e"
+    },
+    {
+      "path": "share.png",
+      "sha256": "f6ddc2cf3904e19f52daef26ff4a42ffae06f55f8f4d00fb15ee166beafa0c9a"
+    },
+    {
+      "path": "share.svg",
+      "sha256": "6c04eab6469e24afcfd0eb7a72c1f550cac37ed19a5d20e50c5828f391d0db96"
+    },
+    {
+      "path": "wallets/coinbase.svg",
+      "sha256": "bae5c9eca975919c6c2c7a0918817ebb3f959a47adcc2dbd6e0db9353136865b"
+    },
+    {
+      "path": "wallets/metamask.svg",
+      "sha256": "892c7dfab8c4ca5682878dda3f42f55a75195d7d365e4adb0832845f3a0a2135"
+    },
+    {
+      "path": "wallets/phantom.svg",
+      "sha256": "f841f8112e131259a2e5123177950099c79487e61e77971f4e193e6c374419eb"
+    },
+    {
+      "path": "wallets/rabby.svg",
+      "sha256": "dcae4de88ebfa10cffa1fe28df13d7c8c0b40736ef2b704f1f2fc348e777e443"
+    }
+  ]
+}

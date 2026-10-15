@@ -1,0 +1,116 @@
+{
+ "checks": [
+  {
+   "name": "render",
+   "passed": true,
+   "exitCode": 0,
+   "durationMs": 7489,
+   "output": "renders, no script errors or missing local files"
+  },
+  {
+   "name": "layout",
+   "passed": true,
+   "exitCode": 0,
+   "durationMs": 0,
+   "output": "no horizontal scroll at 320, 390 or 1440\nno text box overlaps another\nno floating control covers text\nno text cut off by overflow: hidden"
+  },
+  {
+   "name": "targets",
+   "passed": true,
+   "exitCode": 0,
+   "durationMs": 0,
+   "output": "all 14 controls at least 24px or spaced at 390\n5 under the 44px comfortable size"
+  },
+  {
+   "name": "contrast",
+   "passed": true,
+   "exitCode": 0,
+   "durationMs": 0,
+   "output": "all measured text meets 4.5:1 (3:1 large)"
+  },
+  {
+   "name": "casing",
+   "passed": true,
+   "exitCode": 0,
+   "durationMs": 0,
+   "output": "no all-caps text in content"
+  },
+  {
+   "name": "tracking",
+   "passed": true,
+   "exitCode": 0,
+   "durationMs": 0,
+   "output": "letter-spacing natural in content (display type may run tight)"
+  },
+  {
+   "name": "eyebrows",
+   "passed": true,
+   "exitCode": 0,
+   "durationMs": 0,
+   "output": "no kicker labels above headings"
+  },
+  {
+   "name": "type-sizes",
+   "passed": true,
+   "exitCode": 0,
+   "durationMs": 0,
+   "output": "390: 4 sizes in use, 5 with one-offs (14px×52, 16px×8, 20px×6, 24px×6, 36px×1)\n1440: 4 sizes in use, 6 with one-offs (14px×54, 16px×12, 20px×2, 24px×9, 36px×1, 48px×1)\nbar: 6 sizes used more than once, 8 counting one-offs, per width"
+  },
+  {
+   "name": "type-faces",
+   "passed": true,
+   "exitCode": 0,
+   "durationMs": 0,
+   "output": "families (2): ui-sans-serif, georgia\nweights (3): 400, 600, 700"
+  },
+  {
+   "name": "glyphs",
+   "passed": true,
+   "exitCode": 0,
+   "durationMs": 0,
+   "output": "no em dashes or emoji in text"
+  },
+  {
+   "name": "slogans",
+   "passed": true,
+   "exitCode": 0,
+   "durationMs": 0,
+   "output": "no two-beat taglines"
+  },
+  {
+   "name": "repetition",
+   "passed": true,
+   "exitCode": 0,
+   "durationMs": 1,
+   "output": "no repeated lines"
+  },
+  {
+   "name": "copy-budget",
+   "passed": true,
+   "exitCode": 0,
+   "durationMs": 0,
+   "output": "prose on the first screen: 34 words at 390 (bar 60), 41 at 1440 (bar 90)\nall words on the first screen: 73 at 390, 124 at 1440\nwhole page: 353 words, 90 of them prose"
+  },
+  {
+   "name": "chrome",
+   "passed": true,
+   "exitCode": 0,
+   "durationMs": 0,
+   "output": "border and shadow together: 0\ncards inside cards: 0\ngradient text: 0"
+  },
+  {
+   "name": "motion",
+   "passed": true,
+   "exitCode": 0,
+   "durationMs": 0,
+   "output": "transition: all on 0 elements\nendless animations: 0; still running with reduced motion: 0"
+  },
+  {
+   "name": "share",
+   "passed": true,
+   "exitCode": 0,
+   "durationMs": 0,
+   "output": "title \"CROWN | The CRWN throne\", favicon, og:title, og:image, description"
+  }
+ ]
+}

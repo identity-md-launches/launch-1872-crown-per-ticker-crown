@@ -194,12 +194,72 @@ buy and sell (every cut to the challenger, the old wallet unchanged) and `crownP
 of every transfer. The same sequence on Robinhood Chain uses the owner's checklist above, then the
 registry calls from any wallet.
 
-## Site
+## Frontend
 
-`site/index.html` is a static ticker page (vanilla JS + ethers v6 from a CDN, no build step). Fill
-the addresses at the top of the file after launch. It shows the current king, `crownPaid` totals,
-the live challenge (window, both stakes, time remaining), and wires `openChallenge`, `stake`,
-`finalize` and `claim` to an injected wallet, with a plain-English how-it-works section.
+The canonical ticker page is the Vite + React + TypeScript application in `web/`. Its complete static export is `dist/`, including `index.html`, local assets, implementation-derived ABI arrays and `imd-deployment.json`. The older `site/index.html` prototype is retained as prior contributor work; it is not the published entrypoint.
+
+**Deployment status:** this assignment supplied no `.imd/reads/deployment.json` or `.imd/reads/network.json`. The export therefore has an empty contract set and clearly shows “Awaiting launch” / “Not live”. It has no invented addresses, transaction history, balances or deployment identifiers. Wallet connection is available; financial actions remain disabled until a genuine handoff is supplied. The deployment and live funded demo remain the launch workflow’s responsibility. Nothing was broadcast by this frontend worker.
+
+### Install, build and preview
+
+Use Node 24 and the existing Foundry toolchain. From the repository root:
+
+```sh
+forge build
+node web/scripts/build-worker.mjs
+python3 -m http.server 4173 --directory dist
+```
+
+The worker build copies frontend sources into `test/scratch/web`, installs with `npm ci` from `web/package-lock.json`, runs TypeScript and Vite, and writes the production export to root `dist/`. Dependencies stay in disposable scratch and npm’s cache stays under `/tmp`; neither is submitted. No ignore file was changed. The production preview is `http://localhost:4173/`; it also works at a static subpath, as exercised at `/preview/` in the browser tests. HTTPS or localhost is needed for wallet and clipboard APIs.
+
+After the first installation, rebuild with `node web/scripts/build-worker.mjs --installed`. Development with hot reload uses the same runtime deployment file:
+
+```sh
+CROWN_OUT_DIR="$PWD/dist" npm --prefix test/scratch/web run dev
+```
+
+The development middleware serves the manifest and ABIs from `dist/`, so it does not create another address configuration. This middleware is for development only; the production app needs no server beyond static file hosting. `npm run build`, `npm run typecheck`, `npm run dev` and `npm run preview` are also standard package scripts in `web/package.json`.
+
+### Bind the actual launch
+
+`web/src/config.ts` is the central loader for the chain, public RPCs, contract names, ABI paths, wallet connectors and mobile opening links. Contract addresses are loaded exclusively from `dist/imd-deployment.json` at runtime. The application verifies every configured ABI’s canonical Keccak hash before rendering contract controls, and checks chain ID and deployed code before enabling writes.
+
+The build automatically consumes `.imd/reads/deployment.json` and `.imd/reads/network.json` when present. To bind externally supplied workflow files after building:
+
+```sh
+node test/scratch/web/scripts/export.mjs "$PWD" /path/to/deployment.json /path/to/network.json
+node test/scratch/web/scripts/check-export.mjs "$PWD" /path/to/deployment.json /path/to/network.json
+```
+
+Use the actual workflow handoff, not sample values. The exporter copies `launchId`, `chainId`, `sourceCommit`, `attestationHash`, the complete contract set and optional `poolKey`; it copies `network` and `walletAddChain` without modifying their contents. Only the specified manifest keys are emitted. Each ABI is a raw array and must match the handoff’s Keccak-256 of recursively key-sorted JSON (array order preserved). ABI JSON may come from the pinned handoff export or the accepted implementation in `web/public/abi/`. A hash mismatch fails the export. After any asset change, regenerate and check the manifest; it inventories every other exported file with lowercase SHA-256 hashes and excludes itself.
+
+Without a vetted network file, the page has **no active swap, quote, approval or liquidity action**. The pool’s trade control explains that limitation. This assignment implements ticker governance, payout reads and pool details; it does not supply an unvetted trading route. The fallback public chain configuration is from [Robinhood’s official network documentation](https://docs.robinhood.com/chain/connecting/). The worker’s RPC chain-ID check returned `0x1237` (4663). No private RPC or credential appears in source or export.
+
+### Available flows
+
+- Current king token and beneficiary, reign start/age, ticker totals and cumulative `crownPaid[ticker][native ETH]`. Unknown values are never rendered as zero.
+- `openChallenge` with its exact 0.01 ETH bond, same-symbol candidate validation and explicit beneficiary/slashing explanation. The standing challenger is prefilled only when that contract exists in the handoff; otherwise the visitor enters a real token address.
+- `stake` on either side, exact decimal-to-wei conversion, both running stakes, quorum progress, chain-time countdown, 72-hour window and 24-hour timelock. The seven-day reign and three-day failed-challenge cooldown gate opening another challenge.
+- Permissionless `finalize`, per-wallet `claim` by historical challenge ID, and `withdrawTreasury` to the address read from the registry. Claims are scoped to CRWN, including challenges older than the current live one.
+- `registerKing` only if the CRWN ticker is unregistered; the connected wallet is explicitly shown as the beneficiary in this flow.
+- Owner-only, one-time `setRegistry` and `registerPool` setup controls. Visitors see an unconfigured fee-routing notice. Pool registration uses the handoff’s exact key and the brief’s default 100 bps cut. Optional ownership transfer/renunciation remains a direct-contract operation, not a primary page flow.
+- A reign timeline from registry state and paged `Crowned` events, with transaction/explorer links. Each page queries 10,000 blocks and exposes its coverage; “Load earlier reigns” requests the preceding range. A public RPC can silently omit old logs, so the page never claims this is a complete archive. Registry state remains authoritative for the current king.
+- EIP-6963 wallet discovery, mobile MetaMask/Coinbase/Rabby/Phantom opening links, and Coinbase Smart Wallet. No WalletConnect relay or project ID is required. An unknown-chain switch (4902) offers `wallet_addEthereumChain`, then switches again. Wrong-chain, loading, rejected, pending, confirmed and RPC-error states are explicit.
+
+Every write has a review dialog, simulation before signing, an exact-chain wallet check and a receipt/explorer link. The reviewed request and account are frozen; a changed wallet account cancels that review. Replaced, cancelled, reverted and unresolved receipts have distinct handling. Reads poll every five seconds while the page is active, use public RPCs with connected-wallet fallback, and disable writes on read failure or data older than 20 seconds. A hook registry/ticker mismatch also disables actions. ETH/token amounts use their decimals; USD estimates are deliberately unavailable because no price source was supplied.
+
+### Validation and design records
+
+```sh
+npm --prefix test/scratch/web run typecheck
+PLAYWRIGHT_BROWSERS_PATH=/tmp/crown-browsers node test/scratch/web/node_modules/playwright/cli.js install chromium webkit
+CROWN_ROOT="$PWD" PLAYWRIGHT_BROWSERS_PATH=/tmp/crown-browsers npm --prefix test/scratch/web test
+node test/scratch/web/scripts/check-export.mjs "$PWD"
+```
+
+Set `CROWN_BROWSER=webkit` to run the same interaction suite in WebKit when its system libraries are available. Browser tests own a bounded local HTTP server and mocked wallet/RPC; they never send real transactions. Mock addresses occur only in test fixtures and are never exported. Unit tests cover wei precision, time boundaries, address rejection and error translation. Export tests verify supplied-handoff/network preservation, ABI binding and detection of a changed asset.
+
+See [DESIGN.md](DESIGN.md) for implemented tokens and components, [validation/README.md](validation/README.md) for the six-domain Better Interface review, test results, corrections and limitations, and [web/NOTICE.md](web/NOTICE.md) for attribution. The share image is a local 1200×630 PNG generated from `web/public/share.svg`; its regeneration script is `web/scripts/render-share.mjs`. Relative Open Graph paths remain appropriate until the publisher assigns a URL.
 
 ## Build, test, verify
 
@@ -215,7 +275,7 @@ solc version). Dependencies are vendored as plain files in `lib/` (versions in `
 Uniswap v4-core, forge-std, OpenZeppelin Contracts v5.1.0, solmate's `Owned.sol` (needed by
 v4-core's `ProtocolFees`).
 
-Tests (54): `test/CrownRegistry.t.sol` (bond, reign, window, timelock, quorum boundary and tie,
+Tests (78 in the recorded seeded worker run): `test/CrownRegistry.t.sol` (bond, reign, window, timelock, quorum boundary and tie,
 exact-wei slash split for a flip, a failed challenge and a no-quorum challenge, empty winning side,
 pull claims, rejecting receiver, fuzzed conservation of funds), `test/CrownHook.t.sol` (permissions
 and address bits, caller checks, owner setters, all four swap shapes on a funded manager, fuzzed
