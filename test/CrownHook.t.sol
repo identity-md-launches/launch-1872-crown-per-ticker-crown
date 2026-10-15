@@ -11,6 +11,8 @@ import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary.sol";
 import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {CrownHook} from "../src/CrownHook.sol";
@@ -34,8 +36,16 @@ contract RevertingRegistry {
 /// @dev A beneficiary that refuses ETH.
 contract EthRejecter {}
 
+/// @dev Uses more than the hook's payout allowance; the caller must still finish its swap.
+contract GasBurningBeneficiary {
+    receive() external payable {
+        assembly { for {} 1 {} {} }
+    }
+}
+
 contract CrownHookTest is Test {
     using PoolIdLibrary for PoolKey;
+    using TransientStateLibrary for IPoolManager;
 
     uint160 constant SQRT_PRICE_1_1 = 79228162514264337593543950336;
     uint24 constant POOL_FEE = 12_500;
@@ -58,6 +68,7 @@ contract CrownHookTest is Test {
     PoolId poolId;
 
     function setUp() public {
+        vm.chainId(4663);
         vm.warp(1_000_000);
         manager = new PoolManager(address(this));
         token = new CrownToken();
@@ -240,6 +251,7 @@ contract CrownHookTest is Test {
         assertEq(hook.crownPaid(CRWN, ETH), 0.01 ether);
     }
 
+    /// forge-config: default.fuzz.runs = 1000
     function testFuzz_cutMatchesBpsOnExactInputBuy(uint256 amountIn, uint16 bps) public {
         amountIn = bound(amountIn, 1, 100 ether);
         bps = uint16(bound(bps, 0, 500));
@@ -299,6 +311,86 @@ contract CrownHookTest is Test {
         BalanceDelta d = swapper.swap(k, true, 1 ether);
         assertEq(d.amount0(), -1 ether);
         assertEq(h.crownPaid(CRWN, ETH), 0);
+    }
+
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_wrongLengthRegistryResponsesSkipBothCallbacks(uint8 lengthSeed) public {
+        uint256 length = bound(lengthSeed, 0, 192);
+        // A malformed 96-byte response is reported separately: abi.decode currently reverts.
+        if (length == 96) length = 97;
+        vm.mockCall(address(registry), abi.encodeCall(ICrownRegistry.king, (CRWN)), new bytes(length));
+        uint256 before = kingWallet.balance;
+        BalanceDelta d = swapper.swap(key, true, 1 ether);
+        assertEq(d.amount0(), -1 ether);
+        assertGt(d.amount1(), 0);
+        d = swapper.swap(key, false, 1e18);
+        assertEq(d.amount1(), -1e18);
+        assertGt(d.amount0(), 0);
+        assertEq(kingWallet.balance, before);
+        assertEq(hook.crownPaid(CRWN, ETH), 0);
+        _assertSettledWithoutCustody();
+    }
+
+    function test_outOfGasBeneficiaryCannotBlockEitherCallback() public {
+        GasBurningBeneficiary burner = new GasBurningBeneficiary();
+        vm.mockCall(
+            address(registry),
+            abi.encodeCall(ICrownRegistry.king, (CRWN)),
+            abi.encode(address(token), address(burner), uint64(1_000_000))
+        );
+        BalanceDelta d = swapper.swap(key, true, 1 ether);
+        assertEq(d.amount0(), -1 ether);
+        assertGt(d.amount1(), 0);
+        d = swapper.swap(key, false, 1e18);
+        assertEq(d.amount1(), -1e18);
+        assertGt(d.amount0(), 0);
+        assertEq(address(burner).balance, 0);
+        assertEq(hook.crownPaid(CRWN, ETH), 0);
+        _assertSettledWithoutCustody();
+    }
+
+    function test_failedSettlementRollsBackAlreadyAttemptedPayout() public {
+        uint256 before = kingWallet.balance;
+        uint256 managerBefore = address(manager).balance;
+        uint256 tokensBefore = token.balanceOf(address(swapper));
+        vm.deal(address(swapper), 0);
+        // The fee transfer happens inside manager.swap, before this router tries to settle input.
+        // Insufficient router funding then reverts the entire unlock, including that transfer.
+        vm.expectRevert();
+        swapper.swap(key, true, 1 ether);
+        assertEq(kingWallet.balance, before);
+        assertEq(address(manager).balance, managerBefore);
+        assertEq(token.balanceOf(address(swapper)), tokensBefore);
+        assertEq(hook.crownPaid(CRWN, ETH), 0);
+        _assertSettledWithoutCustody();
+    }
+
+    function test_multiplePoolsAggregateOnlyTheirOwnTickerPayments() public {
+        PoolKey memory sameTicker = key;
+        sameTicker.fee = 3_000;
+        manager.initialize(sameTicker, SQRT_PRICE_1_1);
+        vm.prank(owner);
+        hook.registerPool(sameTicker, CRWN, 500);
+        lp.modify(sameTicker, TickMath.minUsableTick(SPACING), TickMath.maxUsableTick(SPACING), 1_000e18);
+        bytes32 otherTicker = keccak256("OTHER");
+        address otherWallet = makeAddr("other-ticker-beneficiary");
+        registry.registerKing(otherTicker, address(token), otherWallet);
+        PoolKey memory otherPool = key;
+        otherPool.fee = 500;
+        manager.initialize(otherPool, SQRT_PRICE_1_1);
+        vm.prank(owner);
+        hook.registerPool(otherPool, otherTicker, 200);
+        lp.modify(otherPool, TickMath.minUsableTick(SPACING), TickMath.maxUsableTick(SPACING), 1_000e18);
+        uint256 before = kingWallet.balance;
+        swapper.swap(key, true, 1 ether);
+        swapper.swap(sameTicker, true, 2 ether);
+        swapper.swap(otherPool, true, 3 ether);
+        assertEq(kingWallet.balance - before, 0.11 ether);
+        assertEq(otherWallet.balance, 0.06 ether);
+        assertEq(hook.crownPaid(CRWN, ETH), 0.11 ether);
+        assertEq(hook.crownPaid(otherTicker, ETH), 0.06 ether);
+        assertEq(hook.crownPaid(otherTicker, key.currency1), 0);
+        _assertSettledWithoutCustody();
     }
 
     function test_unknownTickerNoCut() public {
@@ -381,6 +473,10 @@ contract CrownHookTest is Test {
     // ------------------------------------------------------------ end to end: buy, challenge, stake, finalize, buy
 
     function test_endToEndDethroneChangesFeeRecipient() public {
+        bytes20 registryBefore = bytes20(address(hook.registry()));
+        bytes20 poolTokenBefore = bytes20(Currency.unwrap(key.currency1));
+        bytes32 poolBefore = PoolId.unwrap(poolId);
+        bytes32 tokenCodeBefore = address(token).codehash;
         uint256 kingBefore = kingWallet.balance;
         uint256 chalBefore = challenger.balance;
 
@@ -391,6 +487,9 @@ contract CrownHookTest is Test {
 
         // 2. Challenge with the standing challenger token once the reign is old enough.
         CrownChallengerToken rival = new CrownChallengerToken(challenger);
+        assertTrue(address(rival) != address(token), "two distinct CRWN token deployments");
+        assertEq(rival.name(), token.name());
+        assertEq(rival.symbol(), token.symbol());
         vm.warp(block.timestamp + registry.MIN_REIGN());
         vm.prank(challenger);
         uint256 id = registry.openChallenge{value: 0.01 ether}(CRWN, address(rival));
@@ -407,30 +506,62 @@ contract CrownHookTest is Test {
         swapper.swap(key, true, 1 ether);
         assertEq(kingWallet.balance - kingBefore, 0.03 ether);
 
+        // Closing the vote does not bypass the additional 24-hour timelock.
+        uint64 finalizeAfter = registry.challenges(id).finalizeAfter;
+        vm.warp(finalizeAfter - 1);
+        vm.expectRevert(abi.encodeWithSelector(CrownRegistry.TooEarly.selector, finalizeAfter));
+        registry.finalize(id);
+        swapper.swap(key, true, 1 ether);
+        assertEq(kingWallet.balance - kingBefore, 0.04 ether);
+        assertEq(registry.king(CRWN).token, address(token));
+
         // 4. Finalize after window + timelock: the crown flips.
         vm.warp(registry.challenges(id).finalizeAfter);
         registry.finalize(id);
         ICrownRegistry.King memory k = registry.king(CRWN);
         assertEq(k.token, address(rival));
         assertEq(k.beneficiary, challenger);
+        // Dethroning updates the king record; it does not replace either deployed contract or pool.
+        assertEq(abi.encodePacked(bytes20(address(hook.registry()))), abi.encodePacked(registryBefore));
+        assertEq(abi.encodePacked(bytes20(Currency.unwrap(key.currency1))), abi.encodePacked(poolTokenBefore));
+        assertEq(PoolId.unwrap(key.toId()), poolBefore);
+        assertEq(address(token).codehash, tokenCodeBefore);
+        assertEq(token.totalSupply(), token.SUPPLY());
+        assertEq(hook.crownPaid(CRWN, ETH), 0.04 ether, "finalize transfers no swap fees");
+        vm.expectRevert(abi.encodeWithSelector(CrownRegistry.AlreadyFinalized.selector, id));
+        registry.finalize(id);
 
         // 5. Buy and sell: every cut now goes to the challenger; the old king gets nothing more.
         swapper.swap(key, true, 1 ether);
         assertEq(challenger.balance - chalBefore, 0.01 ether, "the new king is paid");
-        assertEq(kingWallet.balance - kingBefore, 0.03 ether, "the old king is not");
+        assertEq(kingWallet.balance - kingBefore, 0.04 ether, "the old king is not");
         uint256 sellBefore = challenger.balance;
         swapper.swap(key, false, 1e18);
         uint256 sellCut = challenger.balance - sellBefore;
         assertGt(sellCut, 0);
 
         // crownPaid matches every transfer made.
-        assertEq(hook.crownPaid(CRWN, ETH), 0.03 ether + 0.01 ether + sellCut);
+        assertEq(hook.crownPaid(CRWN, ETH), 0.04 ether + 0.01 ether + sellCut);
         assertEq(hook.crownPaid(CRWN, ETH), (kingWallet.balance - kingBefore) + (challenger.balance - chalBefore));
 
         // Stakers pull their money: alice lost 20% of 0.03; challenger gets stake back plus the bonus.
         assertEq(registry.claimable(id, alice), 0.024 ether);
         assertEq(registry.claimable(id, challenger), 0.06 ether + 0.003 ether);
         assertEq(registry.treasuryOwed(), 0.003 ether);
+        _assertSettledWithoutCustody();
+    }
+
+    function _assertSettledWithoutCustody() internal view {
+        IPoolManager m = IPoolManager(address(manager));
+        assertFalse(m.isUnlocked());
+        assertEq(m.getNonzeroDeltaCount(), 0);
+        assertEq(m.currencyDelta(address(hook), ETH), 0);
+        assertEq(m.currencyDelta(address(hook), key.currency1), 0);
+        assertEq(address(hook).balance, 0);
+        assertEq(token.balanceOf(address(hook)), 0);
+        assertEq(manager.balanceOf(address(hook), 0), 0, "no deferred native claims");
+        assertEq(manager.balanceOf(address(hook), uint160(address(token))), 0, "no deferred token claims");
+        assertEq(hook.crownPaid(CRWN, key.currency1), 0, "all cuts are native ETH");
     }
 
     // ------------------------------------------------------------ fee collect by an LP with zero change
