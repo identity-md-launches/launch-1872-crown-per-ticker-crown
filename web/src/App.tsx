@@ -278,7 +278,10 @@ export default function App({ r }: { r: Runtime }) {
               <p>
                 Each ticker has one king token and one beneficiary.
                 Participating pools pay their crown cut directly to that wallet
-                during the swap.
+                during the swap. A beneficiary that is a contract is credited
+                the cut as a native-ETH claim in the pool manager instead, and
+                redeems it in its own transaction, so no outside code ever runs
+                inside somebody else&apos;s swap.
               </p>
             </article>
             <article>

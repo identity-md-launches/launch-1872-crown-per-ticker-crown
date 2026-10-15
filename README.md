@@ -109,22 +109,42 @@ What happens on a swap of a registered native-ETH pool:
 3. Read `registry.king(ticker).beneficiary` with a raw staticcall and decode the beneficiary word by
    hand: an answer that is not exactly 96 bytes, or whose beneficiary word has bits set above the
    address, is malformed and skips the cut (`abi.decode` would revert the swap on it).
-4. The payment runs in its own call frame, `payout(beneficiary, cut)` (an external self-call only
-   the hook may make): it snapshots the PoolManager's nonzero-delta count, the hook's own ETH delta,
-   the manager's ETH balance and its synced-currency and reserves slots, performs
-   `poolManager.take(ETH, beneficiary, cut)` with at most `PAYOUT_GAS` (150,000) gas, and then
-   reverts (`PayoutLeftTraces`) unless the only change is the hook's own `-cut` delta: the count grew
-   by exactly one, the hook's delta is exactly `-cut`, the balance fell by exactly `cut`, and no
-   currency was synced or settled. `_payCut` catches that revert, which rolls back the transfer
-   *and everything the beneficiary did while being paid*, and the swap runs without the cut
-   (`BENEFICIARY_REJECTED`). So a beneficiary contract that accepts the ETH and, inside `receive()`,
-   re-enters the unlocked PoolManager to leave a delta open (its own `mint`/`take`, a `settleFor` of
-   somebody else's debt, a `sync`) cannot make the swapper's unlock end in `CurrencyNotSettled`; its
-   re-entry is undone and it simply forfeits that cut. On success the callback returns `+cut` as the
-   hook delta, so the hook's own delta nets to zero before the callback returns. The swapper pays
-   the cut on top of the pool's input (buys) or receives the pool's output minus the cut (sells).
-   If the PoolManager holds less ETH than the cut, what it holds is paid (`min(cut, balance)`); if it
-   holds none, the cut is skipped.
+4. No beneficiary runs code inside anybody's swap. The hook looks at `beneficiary.code.length`:
+   - **A wallet (no code)** is paid ETH by `poolManager.take(ETH, beneficiary, cut)`, which executes
+     nothing at a code-less address. `take` pays from what the PoolManager already holds (the
+     swapper settles only afterwards), so if the manager holds less ETH than the cut, what it holds
+     is paid (`min(cut, balance)`), and if it holds none the cut is skipped (`MANAGER_SHORT_OF_ETH`).
+   - **A contract (a multisig, a splitter, anything with code)** is credited `cut` as an ERC-6909
+     claim on native ETH *in the PoolManager*, `poolManager.mint(beneficiary, 0, cut)`, inside the
+     same swap. Minting runs no code of the beneficiary's, needs no balance in the manager (the
+     swapper's own ETH settles it, so the claim is always the full cut), and is the beneficiary's
+     own balance at once: nothing is stored in the hook and nothing is pooled. `CrownClaimMinted`
+     is emitted beside `CrownPaid`. The beneficiary turns claims into ETH in its own transaction:
+     `poolManager.setOperator(hook, true)` once, then `hook.redeem(amount, to)` (the hook unlocks
+     the manager, burns the caller's claims and takes the ETH to `to`, so its delta nets to zero and
+     it holds nothing in between); a contract with its own unlock callback can also `burn` and
+     `take` directly. Nobody can redeem anyone else's claims through the hook.
+
+   Why not send ETH to a contract: a transfer runs the recipient's code while the PoolManager is
+   unlocked, in the middle of somebody else's swap. The previous round's `payout` checks caught a
+   recipient that left an open delta, moved ETH or synced a currency, but not one that traded on the
+   pool and settled entirely in ERC-6909 claims: that leaves none of those traces, yet moves the
+   price before an exact-input buy or exact-output sell runs, so a swapper with a slippage bound
+   reverts (and the recipient's trade with it, at no cost) and one without it is sandwiched. A
+   claim gives the recipient no execution at all, which closes every variant, on every pool of the
+   manager, whatever gas it is given (`test_claimsTradingBeneficiaryCannotFrontRunOrBlockABoundedBuy`,
+   `test_hostileBeneficiaryNeverRunsAndCannotBlockSwaps`).
+
+   Either payment runs in its own call frame, `payout(beneficiary, cut, asClaim)` (an external
+   self-call only the hook may make), which snapshots the PoolManager's nonzero-delta count, the
+   hook's own ETH delta, the manager's ETH balance and its synced-currency and reserves slots, pays,
+   and reverts (`PayoutLeftTraces`) unless the only change is the hook's own `-cut` delta (and, for
+   a transfer, the balance falling by exactly `cut`). `_payCut` catches that revert and the swap
+   runs without the cut (`BENEFICIARY_REJECTED`); with no recipient code running, this is a
+   defensive invariant rather than a path any known input reaches. On success the callback returns
+   `+cut` as the hook delta, so the hook's own delta nets to zero before the callback returns. The
+   swapper pays the cut on top of the pool's input (buys) or receives the pool's output minus the
+   cut (sells).
 5. `crownPaid[ticker][currency]` grows by exactly what was transferred; `CrownPaid` is emitted with
    that amount.
 
@@ -136,18 +156,21 @@ The hook never holds funds and never reverts a swap. Every failure path skips th
 | `POOL_NOT_REGISTERED` | the pool is initialized but the owner has not bound its ticker yet (`ticker` is zero in the event; the amount is the default cut it would have charged) |
 | `REGISTRY_READ_FAILED` | the registry read reverts, or returns data that is not 96 bytes or whose beneficiary word is not a clean address |
 | `NO_KING` | the pool's ticker has no king (beneficiary is zero) |
-| `MANAGER_SHORT_OF_ETH` | the PoolManager holds no ETH at all (see below); a partial balance is paid, not skipped |
-| `BENEFICIARY_REJECTED` | the beneficiary refuses ETH, burns more than `PAYOUT_GAS`, or re-entered the PoolManager during its payment (the whole payment is rolled back) |
+| `MANAGER_SHORT_OF_ETH` | a wallet beneficiary, and the PoolManager holds no ETH at all (see below); a partial balance is paid, not skipped; a contract beneficiary's claim never needs a balance |
+| `BENEFICIARY_REJECTED` | the payment self-call reverted (`PayoutLeftTraces`); defensive, since no beneficiary code runs during a payment |
 
-Pay-at-source versus a fresh PoolManager: `take` pays from what the PoolManager already holds, and the
-swapper settles only after the hook runs. The launch pool is seeded with tokens only, so the first
-ETH-paying buy on a PoolManager that holds no ETH is executed without the cut; after it the manager
-holds that buy's ETH, and every later cut is paid in full when the manager's ETH covers it and
-otherwise up to what it holds (`test_freshManagerSeededWithTokensOnly`,
+Pay-at-source versus a fresh PoolManager: for a wallet beneficiary `take` pays from what the
+PoolManager already holds, and the swapper settles only after the hook runs. The launch pool is
+seeded with tokens only, so the first ETH-paying buy on a PoolManager that holds no ETH is executed
+without the cut; after it the manager holds that buy's ETH, and every later cut is paid in full when
+the manager's ETH covers it and otherwise up to what it holds (`test_freshManagerSeededWithTokensOnly`,
 `test_partialCutWhenManagerHoldsLessThanTheCut`). The brief forbids storing or pooling fees for
-claiming, so a shortfall is paid partially or skipped rather than minted as an ERC-6909 claim. A
-beneficiary contract that rejects ETH, or misbehaves while being paid, does not halt trading: its
-cuts are skipped until the crown changes hands.
+claiming, so a wallet's shortfall is paid partially or skipped rather than kept anywhere; the hook
+never holds a claim. A contract beneficiary's claim is minted in full regardless of the manager's
+balance (`test_contractBeneficiaryClaimNeedsNoManagerBalance`). A beneficiary contract that cannot
+receive ETH does not halt trading and does not lose its cut: the claim is credited all the same
+(`test_contractBeneficiaryIsPaidInClaimsNotEth`), and it redeems through `redeem` from any address
+it can call out from.
 
 Owner functions (owner = `$owner`, the launch payer; never the factory or `tx.origin`):
 
@@ -170,11 +193,13 @@ There are no other admin functions, no pause, no upgrade. The owner may `renounc
 setup. Liquidity callbacks are not enabled, so the factory's zero-liquidity fee collect passes
 through untouched.
 
-External calls the hook makes, all inside the PoolManager's unlock: the registry read (staticcall),
-the payment self-call `payout` (which performs `poolManager.take` and reads the manager's transient
-accounting through `exttload`), and the rehearsal self-call `simulateSwap`, which calls
-`poolManager.swap` and reverts. Both self-calls refuse every caller but the hook (`NotSelf`). The
-hook holds no funds and has no storage either self-call could touch.
+External calls the hook makes inside a swap's unlock: the registry read (staticcall), the payment
+self-call `payout` (which performs `poolManager.take` for a wallet or `poolManager.mint` for a
+contract and reads the manager's transient accounting through `exttload`), and the rehearsal
+self-call `simulateSwap`, which calls `poolManager.swap` and reverts. Both self-calls refuse every
+caller but the hook (`NotSelf`). Outside any swap, `redeem` calls `poolManager.unlock` and its
+`unlockCallback` (PoolManager only) burns the caller's claims and takes the ETH to the recipient the
+caller named. The hook holds no funds and no claims.
 
 Wizard-style configuration record for the hook:
 
@@ -226,9 +251,11 @@ beyond its name and symbol; the swap fee is in the hook.
 
 Operational notes: `CrownRegistry` has no owner and no parameters to maintain. `finalize` and
 `withdrawTreasury` are permissionless and must be called by someone (a keeper, the site, anyone);
-nothing pays out automatically. Stakers pull with `claim`. The king's beneficiary must be able to
-receive plain ETH transfers within 150,000 gas without touching the PoolManager, or its cuts are
-skipped.
+nothing pays out automatically. Stakers pull with `claim`. A king's beneficiary that is a wallet
+receives its cuts as plain ETH transfers. A beneficiary with code (a multisig, a splitter) receives
+them as ERC-6909 claims on native ETH in the PoolManager and redeems them in its own transaction:
+`poolManager.setOperator(hook, true)` once, then `hook.redeem(amount, to)` whenever it likes. Its
+claim balance is `poolManager.balanceOf(beneficiary, 0)`.
 
 ## Demo flow (what the integration test does)
 
@@ -319,15 +346,18 @@ solc version). Dependencies are vendored as plain files in `lib/` (versions in `
 Uniswap v4-core, forge-std, OpenZeppelin Contracts v5.1.0, solmate's `Owned.sol` (needed by
 v4-core's `ProtocolFees`).
 
-Tests (82 in the recorded seeded worker run; the hostile-beneficiary, displacement, partial-cut and
-registration-guard cases were added in the findings revision): `test/CrownRegistry.t.sol` (bond, reign, window, timelock, quorum boundary and tie,
+Tests (88 in the recorded seeded worker run; the hostile-beneficiary, displacement, partial-cut and
+registration-guard cases were added in the first findings revision, and the claims-trading
+beneficiary, contract-beneficiary claim and `redeem` cases in the second): `test/CrownRegistry.t.sol` (bond, reign, window, timelock, quorum boundary and tie,
 exact-wei slash split for a flip, a failed challenge and a no-quorum challenge, empty winning side,
 pull claims, rejecting receiver, fuzzed conservation of funds), `test/CrownHook.t.sol` (permissions
 and address bits, caller checks, owner setters, all four swap shapes on a funded manager, fuzzed
 cut, an unfilled order in an empty pool and price-limited partial fills in both directions paying
 the cut only on the executed ETH, the rehearsal refusing outside callers, every skip reason
-including a malformed registry answer, a fresh tokens-only PoolManager and a rejecting
-beneficiary, the end-to-end dethrone, a zero-liquidity collect), `test/CrownToken.t.sol`,
+including a malformed registry answer, a fresh tokens-only PoolManager, contract beneficiaries
+paid as claims without ever running (a rejecting receiver, a gas burner, a re-entering one, one
+that trades on the pool from claims) and `redeem`, the end-to-end dethrone, a zero-liquidity
+collect), `test/CrownToken.t.sol`,
 `test/DeployCrown.t.sol`.
 `test/mocks` and `test/floor` hold the routers and owner checks the floor suite imports.
 
@@ -346,9 +376,9 @@ beneficiary, the end-to-end dethrone, a zero-liquidity collect), `test/CrownToke
   the bond ladder is 0.01, 0.02, 0.04 … ETH.
 - The cut currency is always native ETH; `registerPool` refuses pools whose `currency0` is not ETH.
   `crownPaid` is keyed by currency anyway, as the brief asks.
-- `PAYOUT_GAS` (150,000) is a chosen constant: it caps what a hostile beneficiary can burn inside
-  someone else's swap. What it can *do* in that gas is bounded by `payout`'s accounting checks: any
-  trace it leaves in the PoolManager rolls its payment back.
+- `PAYOUT_GAS` (150,000) is a chosen constant bounding the gas of a wallet payment. Only code-less
+  addresses are paid by transfer, so nothing but the transfer runs in it; a beneficiary with code is
+  paid as an ERC-6909 claim and never executes during a swap (see "No beneficiary runs code" above).
 - Tests pass with an empty environment and in any order; none reads env vars.
 - Tests are not an audit: an independent adversarial review is still needed before funds are at
   stake.

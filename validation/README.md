@@ -1,5 +1,37 @@
 # Frontend validation
 
+## Revision of 2026-10-15 (second findings round)
+
+This revision answers one reviewer finding (`.imd-responses.json`): a king's beneficiary with code
+could trade on the pool inside its own payout, settling in ERC-6909 claims so the previous `payout`
+checks saw nothing, and so block or front-run exact-input buys and exact-output sells. The fix is in
+`src/CrownHook.sol` and described in the README ("No beneficiary runs code"): wallets are paid ETH
+by `take`, contracts are credited an ERC-6909 native-ETH claim by `mint` and redeem it through the
+new `redeem`. The frontend changed only where the contract did: the regenerated `CrownHook` ABI
+(`payout` gains `asClaim`; `redeem`, `unlockCallback`, `CrownClaimMinted`, `ClaimRedeemed`,
+`ZeroAmount` are new) and one sentence in how-it-works step 01 explaining the claim form of payment.
+Everything below was re-run on the final source and the rebuilt `dist/` export.
+
+| Check | Result |
+| --- | --- |
+| Reproduction | A scratch test following the finding's recipe failed on the starting tree exactly as reported (bounded buy reverted with `slippage`; unbounded buy received 4% less than quoted while `crownPaid` grew). It passes on this tree, and the scenario is now a permanent test (`test_claimsTradingBeneficiaryCannotFrontRunOrBlockABoundedBuy`). |
+| `forge build` | Pass with the pinned Solidity 0.8.26 settings. |
+| Seeded `forge test` | **88 passed, 0 failed, 0 skipped** (`FOUNDRY_FUZZ_SEED` as given), including the registry and hook invariant suites. |
+| Production build and `tsc --noEmit` | Pass (`node web/scripts/build-worker.mjs`; dependencies installed in `test/scratch/web`, export written to root `dist/`). |
+| Chromium test run | **12 passed, 0 failed**: seven browser tests, four domain tests, one export test, against the rebuilt export with the regenerated ABI (`CROWN_ROOT` set to the repository root; Playwright's Chromium 1248 installed under the home cache, outside the repository). |
+| WebKit test run | Not repeated in this revision; the earlier WebKit run below predates it. |
+| Pinned design-critic probe | **16 of 16 passed** on the rebuilt export; output replaced in [taste.json](taste.json). The 390-wide screenshot shows the product ("The CRWN throne"), the wallet control and the "Open challenge" action on the first screen; nothing scrolls sideways at 320, 390 or 1440. |
+| Export verification | Pass: **20 assets, 1,556,597 bytes** excluding the manifest; SHA-256 inventory, ABI bindings, allowed manifest keys and relative base verified after the final build (`web/scripts/check-export.mjs`). |
+
+Better Interface review of the one copy change (writing domain): the sentence sits in the
+how-it-works step it explains, uses plain words ("credited the cut as a native-ETH claim in the pool
+manager", "redeems it in its own transaction") and names no code. No layout, typography, colour,
+component or accessibility change was made. Limitations unchanged from the previous revision: no
+live-chain interaction (the launch has no handoff yet, so every contract action stays disabled
+with the "Awaiting launch" state), and a contract beneficiary's `redeem` has no control on the page
+(it is an owner-of-claims action for a multisig or splitter, documented in the README; the page's
+connected wallets are code-less accounts paid in ETH directly).
+
 ## Revision of 2026-10-15 (findings round)
 
 This revision answers six reviewer findings (`.imd-responses.json`): a hostile beneficiary that could

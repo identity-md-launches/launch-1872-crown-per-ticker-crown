@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
+import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
@@ -21,17 +22,23 @@ import {ThroneRegistry} from "./ThroneRegistry.sol";
 /// @notice A Uniswap v4 fee hook that skims a per-pool cut of every swap's native-ETH side and pays
 /// it, inside the same swap, to the current king's beneficiary as recorded in `CrownRegistry`.
 ///
-/// Pay-at-source: the hook never holds the cut. It is taken from the PoolManager straight to the
-/// beneficiary while the swap settles, and the hook's delta nets to zero before the callback returns.
-/// Nothing is pooled for claiming.
+/// Pay-at-source: the hook never holds the cut. It leaves the PoolManager's accounting for the
+/// beneficiary's while the swap settles, and the hook's delta nets to zero before the callback
+/// returns. Nothing is pooled in the hook for claiming.
+///
+/// No beneficiary runs code inside anybody's swap. A beneficiary without code (a wallet) is paid
+/// ETH straight from the PoolManager (`take`), which executes nothing. A beneficiary with code (a
+/// multisig, a splitter, or a contract built to trade while being paid) is credited an ERC-6909
+/// claim on native ETH in the PoolManager (`mint`), which calls nothing either; it redeems the
+/// claim for ETH in its own transaction through `redeem`. Sending ETH to a contract would run its
+/// code while the PoolManager is unlocked, inside somebody else's swap, where it could trade
+/// ahead of the swapper or make the swap fail; a claim cannot.
 ///
 /// Never blocks a swap: when the registry is unset, the ticker unregistered, the registry read
-/// reverts, the king has no beneficiary, the PoolManager holds no ETH to pay from, or the
-/// beneficiary rejects the payment, the swap proceeds without the cut. The payment runs in its own
-/// call frame (`payout`) that checks the PoolManager's accounting afterwards: a beneficiary that
-/// accepts the ETH but leaves anything else behind in the unlocked PoolManager (an open delta of
-/// its own, a settlement of somebody else's, a sync) is rolled back together with its payment, so
-/// no beneficiary can hold the pool hostage.
+/// reverts, the king has no beneficiary, or the PoolManager holds no ETH to pay a wallet from, the
+/// swap proceeds without the cut. The payment runs in its own call frame (`payout`) that checks the
+/// PoolManager's accounting afterwards and is rolled back, cut skipped, if anything but the hook's
+/// own `-cut` delta changed.
 ///
 /// The cut is always ETH, which is `currency0` of every native pool. When ETH is the swap's
 /// specified amount (exact-input buy, exact-output sell) it is taken in `beforeSwap` through the
@@ -43,7 +50,7 @@ import {ThroneRegistry} from "./ThroneRegistry.sol";
 /// the pool is about to execute (`simulateSwap`, a self-call that always reverts and carries the
 /// pool's delta back in its revert data): a partially filled order at its price limit, or one in a
 /// pool without liquidity, pays the cut on what was filled, which for no fill is nothing.
-contract CrownHook is IHooks, Ownable {
+contract CrownHook is IHooks, IUnlockCallback, Ownable {
     using PoolIdLibrary for PoolKey;
     using TransientStateLibrary for IPoolManager;
 
@@ -54,8 +61,8 @@ contract CrownHook is IHooks, Ownable {
     /// @notice Hard ceiling on any pool's cut.
     uint16 public constant MAX_CUT_BPS = 500;
     uint256 public constant BPS = 10_000;
-    /// @notice Gas forwarded to the PoolManager for the beneficiary payment. Bounds what a hostile
-    /// beneficiary can burn inside somebody else's swap; a plain wallet or a multisig needs far less.
+    /// @notice Gas forwarded to the PoolManager for a wallet payment. Only code-less addresses are
+    /// paid by transfer, so nothing but the transfer itself runs in it; a bound all the same.
     uint256 public constant PAYOUT_GAS = 150_000;
     /// @notice Largest ETH amount the hook quotes a cut on; a swap beyond it cannot settle in v4 anyway.
     uint256 public constant MAX_AMOUNT = uint256(uint128(type(int128).max));
@@ -88,6 +95,10 @@ contract CrownHook is IHooks, Ownable {
     event PoolInitialized(PoolId indexed poolId, Currency currency0, Currency currency1);
     event PoolRegistered(PoolId indexed poolId, bytes32 indexed ticker, uint16 cutBps);
     event CrownPaid(PoolId indexed poolId, bytes32 indexed ticker, address indexed beneficiary, uint256 amount);
+    /// @notice The cut in `CrownPaid` was credited as an ERC-6909 claim on native ETH in the PoolManager
+    /// because the beneficiary has code; it redeems through `redeem`.
+    event CrownClaimMinted(PoolId indexed poolId, bytes32 indexed ticker, address indexed beneficiary, uint256 amount);
+    event ClaimRedeemed(address indexed holder, address indexed to, uint256 amount);
     event CutSkipped(PoolId indexed poolId, bytes32 indexed ticker, uint256 amount, bytes32 reason);
 
     // ---------------------------------------------------------------- errors
@@ -107,6 +118,7 @@ contract CrownHook is IHooks, Ownable {
     error RegistryNotSet();
     error KingIsNotPoolToken(bytes32 ticker, address king, address poolToken);
     error PayoutLeftTraces();
+    error ZeroAmount();
 
     // ---------------------------------------------------------------- constructor
 
@@ -374,17 +386,22 @@ contract CrownHook is IHooks, Ownable {
             emit CutSkipped(id, ticker, cut, "NO_KING");
             return 0;
         }
-        // `take` pays from what the PoolManager already holds; the swapper settles only afterwards.
-        // Pay what it holds when that is less than the cut, and nothing when it holds nothing.
-        uint256 available = address(poolManager).balance;
-        if (available == 0) {
-            emit CutSkipped(id, ticker, cut, "MANAGER_SHORT_OF_ETH");
-            return 0;
+        bool asClaim = beneficiary.code.length != 0;
+        if (!asClaim) {
+            // `take` pays from what the PoolManager already holds; the swapper settles only afterwards.
+            // Pay what it holds when that is less than the cut, and nothing when it holds nothing.
+            // A claim needs no balance: it is settled by the swapper's own ETH.
+            uint256 available = address(poolManager).balance;
+            if (available == 0) {
+                emit CutSkipped(id, ticker, cut, "MANAGER_SHORT_OF_ETH");
+                return 0;
+            }
+            if (available < cut) cut = available;
         }
-        if (available < cut) cut = available;
-        try this.payout(beneficiary, cut) {
+        try this.payout(beneficiary, cut, asClaim) {
             crownPaid[ticker][CurrencyLibrary.ADDRESS_ZERO] += cut;
             emit CrownPaid(id, ticker, beneficiary, cut);
+            if (asClaim) emit CrownClaimMinted(id, ticker, beneficiary, cut);
             return cut;
         } catch {
             emit CutSkipped(id, ticker, cut, "BENEFICIARY_REJECTED");
@@ -392,12 +409,12 @@ contract CrownHook is IHooks, Ownable {
         }
     }
 
-    /// @notice Pays `cut` ETH from the PoolManager to `beneficiary` and reverts unless the only trace
-    /// the payment left in the PoolManager is the hook's own `-cut` delta. Only the hook may call it,
-    /// from `_payCut`, which catches the revert: a beneficiary that re-enters the unlocked
-    /// PoolManager during its payment (opens a delta, settles somebody's, syncs a currency) is
-    /// rolled back together with its payment, and the swap proceeds without the cut.
-    function payout(address beneficiary, uint256 cut) external {
+    /// @notice Pays `cut` of native ETH from the PoolManager to `beneficiary`: as a transfer when
+    /// `asClaim` is false (a code-less address, so nothing runs), as an ERC-6909 claim minted to the
+    /// beneficiary when it is true (a contract; minting runs no code of its own). Reverts unless the
+    /// only trace the payment left in the PoolManager is the hook's own `-cut` delta. Only the hook
+    /// may call it, from `_payCut`, which catches the revert and skips the cut.
+    function payout(address beneficiary, uint256 cut, bool asClaim) external {
         if (msg.sender != address(this)) revert NotSelf();
         IPoolManager pm = poolManager;
         uint256 deltasBefore = pm.getNonzeroDeltaCount();
@@ -406,16 +423,46 @@ contract CrownHook is IHooks, Ownable {
         bytes32 syncedCurrencyBefore = pm.exttload(CurrencyReserves.CURRENCY_SLOT);
         bytes32 syncedReservesBefore = pm.exttload(CurrencyReserves.RESERVES_OF_SLOT);
 
-        pm.take{gas: PAYOUT_GAS}(CurrencyLibrary.ADDRESS_ZERO, beneficiary, cut);
+        if (asClaim) {
+            if (beneficiary.code.length == 0) revert PayoutLeftTraces();
+            pm.mint(beneficiary, 0, cut);
+        } else {
+            if (beneficiary.code.length != 0) revert PayoutLeftTraces();
+            pm.take{gas: PAYOUT_GAS}(CurrencyLibrary.ADDRESS_ZERO, beneficiary, cut);
+            balanceBefore -= cut;
+        }
 
         // The hook's delta went from zero to -cut and nothing else moved: no other delta was opened
-        // or closed, no ETH entered or left beyond the cut, no currency was synced or settled.
+        // or closed, no ETH entered or left beyond a transferred cut, no currency was synced or settled.
         if (
             pm.getNonzeroDeltaCount() != deltasBefore + 1 || hookDeltaBefore != 0
                 || pm.currencyDelta(address(this), CurrencyLibrary.ADDRESS_ZERO) != -int256(cut)
-                || address(pm).balance != balanceBefore - cut
+                || address(pm).balance != balanceBefore
                 || pm.exttload(CurrencyReserves.CURRENCY_SLOT) != syncedCurrencyBefore
                 || pm.exttload(CurrencyReserves.RESERVES_OF_SLOT) != syncedReservesBefore
         ) revert PayoutLeftTraces();
+    }
+
+    // ---------------------------------------------------------------- claim redemption
+
+    /// @notice Redeems `amount` of the caller's ERC-6909 native-ETH claims in the PoolManager for
+    /// ETH sent to `to`. For beneficiaries with code, which are paid in claims. The caller must first
+    /// approve the hook on the PoolManager (`setOperator(hook, true)` or an allowance on id 0); the
+    /// hook burns only the caller's own claims and holds nothing in between.
+    function redeem(uint256 amount, address to) external {
+        if (amount == 0) revert ZeroAmount();
+        if (to == address(0)) revert ZeroAddress();
+        poolManager.unlock(abi.encode(msg.sender, to, amount));
+        emit ClaimRedeemed(msg.sender, to, amount);
+    }
+
+    /// @inheritdoc IUnlockCallback
+    /// @dev Only reached through `redeem`: burns the holder's claim (credits the hook `+amount`) and
+    /// takes the ETH to the recipient (`-amount`), so the hook's delta nets to zero.
+    function unlockCallback(bytes calldata data) external onlyPoolManager returns (bytes memory) {
+        (address holder, address to, uint256 amount) = abi.decode(data, (address, address, uint256));
+        poolManager.burn(holder, 0, amount);
+        poolManager.take(CurrencyLibrary.ADDRESS_ZERO, to, amount);
+        return "";
     }
 }

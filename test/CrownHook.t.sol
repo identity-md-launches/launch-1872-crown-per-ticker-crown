@@ -26,6 +26,7 @@ import {HookFlags} from "../src/HookFlags.sol";
 import {HookDeployer} from "./utils/HookDeployer.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {Swapper} from "./mocks/Swapper.sol";
+import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {LiquidityProvider} from "./mocks/LiquidityProvider.sol";
 
 /// @dev A registry stand-in whose read always reverts.
@@ -51,11 +52,12 @@ contract DirtyRegistry {
 /// @dev A beneficiary that refuses ETH.
 contract EthRejecter {}
 
-/// @dev A challenge winner whose receive() accepts the cut and leaves a 1-wei ERC-6909 debt open in
-/// the unlocked PoolManager, which would end the swapper's unlock in CurrencyNotSettled.
+/// @dev A challenge winner whose receive() would, if it ever ran while being paid, leave a 1-wei
+/// ERC-6909 debt open in the unlocked PoolManager and end the swapper's unlock in CurrencyNotSettled.
 contract HostileBeneficiary {
     IPoolManager immutable manager;
     uint8 public mode; // 0: mint a claim, 1: take 1 wei, 2: sync a currency
+    uint256 public calls;
 
     constructor(IPoolManager m) payable {
         manager = m;
@@ -66,11 +68,102 @@ contract HostileBeneficiary {
     }
 
     receive() external payable {
+        calls++;
         if (msg.sender != address(manager)) return;
         if (mode == 0) manager.mint(address(this), 0, 1);
         else if (mode == 1) manager.take(Currency.wrap(address(0)), address(this), 1);
         else manager.sync(Currency.wrap(address(0xBEEF)));
     }
+}
+
+/// @dev A beneficiary that parks ETH in the PoolManager as ERC-6909 claims and, were its code to
+/// run while being paid inside somebody else's swap, would trade on the pool ahead of that swap
+/// settling entirely in claims, which leaves no delta, balance or sync trace behind.
+contract ClaimsTrader is IUnlockCallback {
+    IPoolManager immutable manager;
+    PoolKey key;
+    uint256 public calls;
+
+    constructor(IPoolManager m, PoolKey memory k) payable {
+        manager = m;
+        key = k;
+    }
+
+    function deposit(uint256 amount) external {
+        manager.unlock(abi.encode(uint8(0), amount));
+    }
+
+    function redeemDirectly(uint256 amount) external {
+        manager.unlock(abi.encode(uint8(1), amount));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager), "not manager");
+        (uint8 op, uint256 amount) = abi.decode(data, (uint8, uint256));
+        if (op == 0) {
+            manager.sync(Currency.wrap(address(0)));
+            manager.settle{value: amount}();
+            manager.mint(address(this), 0, amount);
+        } else {
+            manager.burn(address(this), 0, amount);
+            manager.take(Currency.wrap(address(0)), address(this), amount);
+        }
+        return "";
+    }
+
+    function approveHook(address hook) external {
+        manager.setOperator(hook, true);
+    }
+
+    bool public passive;
+
+    function setPassive(bool p) external {
+        passive = p;
+    }
+
+    receive() external payable {
+        calls++;
+        if (msg.sender != address(manager) || passive) return;
+        BalanceDelta d = manager.swap(
+            key,
+            SwapParams({zeroForOne: true, amountSpecified: 20e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
+            ""
+        );
+        manager.burn(address(this), 0, uint256(uint128(-d.amount0())));
+        manager.mint(address(this), uint256(uint160(Currency.unwrap(key.currency1))), uint256(uint128(d.amount1())));
+    }
+}
+
+/// @dev A router with an output floor, like the universal router's amountOutMinimum.
+contract BoundedSwapper is IUnlockCallback {
+    IPoolManager immutable manager;
+
+    constructor(IPoolManager m) {
+        manager = m;
+    }
+
+    function buy(PoolKey memory key, uint256 amountIn, uint256 minOut) external returns (BalanceDelta) {
+        return abi.decode(manager.unlock(abi.encode(key, amountIn, minOut)), (BalanceDelta));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager), "not manager");
+        (PoolKey memory key, uint256 amountIn, uint256 minOut) = abi.decode(data, (PoolKey, uint256, uint256));
+        BalanceDelta d = manager.swap(
+            key,
+            SwapParams({
+                zeroForOne: true, amountSpecified: -int256(amountIn), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            ""
+        );
+        require(uint256(uint128(d.amount1())) >= minOut, "slippage");
+        manager.sync(Currency.wrap(address(0)));
+        manager.settle{value: uint256(uint128(-d.amount0()))}();
+        manager.take(key.currency1, address(this), uint256(uint128(d.amount1())));
+        return abi.encode(d);
+    }
+
+    receive() external payable {}
 }
 
 /// @dev A registry that always names one wallet: what an owner could bind if the hook accepted any code.
@@ -86,7 +179,7 @@ contract FakeRegistry {
     }
 }
 
-/// @dev Uses more than the hook's payout allowance; the caller must still finish its swap.
+/// @dev Would burn more than the hook's payout allowance if its code ever ran during a payment.
 contract GasBurningBeneficiary {
     receive() external payable {
         assembly { for {} 1 {} {} }
@@ -614,7 +707,9 @@ contract CrownHookTest is Test {
         _assertSettledWithoutCustody();
     }
 
-    function test_outOfGasBeneficiaryCannotBlockEitherCallback() public {
+    /// @dev A beneficiary with code is never called: it is credited a claim, so even one that would
+    /// burn all the gas it is given cannot touch either callback.
+    function test_gasBurningBeneficiaryIsPaidInClaimsWithoutRunning() public {
         GasBurningBeneficiary burner = new GasBurningBeneficiary();
         vm.mockCall(
             address(registry),
@@ -627,8 +722,9 @@ contract CrownHookTest is Test {
         d = swapper.swap(key, false, 1e18);
         assertEq(d.amount1(), -1e18);
         assertGt(d.amount0(), 0);
-        assertEq(address(burner).balance, 0);
-        assertEq(hook.crownPaid(CRWN, ETH), 0);
+        assertEq(address(burner).balance, 0, "no ETH was sent to a contract");
+        assertGt(hook.crownPaid(CRWN, ETH), 0.01 ether);
+        assertEq(manager.balanceOf(address(burner), 0), hook.crownPaid(CRWN, ETH), "paid as claims");
         _assertSettledWithoutCustody();
     }
 
@@ -698,7 +794,8 @@ contract CrownHookTest is Test {
         assertEq(ticker, bytes32(0));
     }
 
-    function test_beneficiaryRejectingEthNoCut() public {
+    /// @dev A contract that cannot receive ETH is still paid, as a claim, and trading continues.
+    function test_contractBeneficiaryIsPaidInClaimsNotEth() public {
         EthRejecter rejecter = new EthRejecter();
         CrownRegistry r = new CrownRegistry("CRWN", address(token), address(rejecter));
         CrownHook h = HookDeployer.deploy(manager, owner);
@@ -709,16 +806,49 @@ contract CrownHookTest is Test {
         h.registerPool(k, CRWN, 100);
         vm.stopPrank();
         lp.modify(k, TickMath.minUsableTick(SPACING), TickMath.maxUsableTick(SPACING), 1_000e18);
-        vm.expectEmit(true, true, false, true);
-        emit CrownHook.CutSkipped(k.toId(), CRWN, 0.01 ether, "BENEFICIARY_REJECTED");
+        vm.expectEmit(true, true, true, true);
+        emit CrownHook.CrownPaid(k.toId(), CRWN, address(rejecter), 0.01 ether);
+        vm.expectEmit(true, true, true, true);
+        emit CrownHook.CrownClaimMinted(k.toId(), CRWN, address(rejecter), 0.01 ether);
         BalanceDelta d = swapper.swap(k, true, 1 ether);
         assertEq(d.amount0(), -1 ether);
         assertEq(address(rejecter).balance, 0);
-        assertEq(h.crownPaid(CRWN, ETH), 0);
-        // The sell direction (afterSwap path) proceeds as well.
+        assertEq(manager.balanceOf(address(rejecter), 0), 0.01 ether);
+        assertEq(h.crownPaid(CRWN, ETH), 0.01 ether);
+        // The sell direction (afterSwap path) pays a claim as well.
         d = swapper.swap(k, false, 1e18);
         assertEq(d.amount1(), -1e18);
-        assertEq(h.crownPaid(CRWN, ETH), 0);
+        uint256 sellCut = _abs(d.amount0()) * 100 / 9_900;
+        assertApproxEqAbs(h.crownPaid(CRWN, ETH), 0.01 ether + sellCut, 1);
+        assertEq(manager.balanceOf(address(rejecter), 0), h.crownPaid(CRWN, ETH), "claims match crownPaid");
+        assertEq(IPoolManager(address(manager)).currencyDelta(address(h), ETH), 0);
+        assertEq(manager.balanceOf(address(h), 0), 0, "the hook holds no claims");
+    }
+
+    /// @dev A claim is paid in full even when the PoolManager holds no ETH: it is settled by the
+    /// swapper's own input, not from the manager's balance.
+    function test_contractBeneficiaryClaimNeedsNoManagerBalance() public {
+        PoolManager fresh = new PoolManager(address(this));
+        EthRejecter safe = new EthRejecter();
+        CrownRegistry r = new CrownRegistry("CRWN", address(token), address(safe));
+        CrownHook h = HookDeployer.deploy(fresh, owner);
+        PoolKey memory k = PoolKey(ETH, Currency.wrap(address(token)), POOL_FEE, SPACING, IHooks(address(h)));
+        fresh.initialize(k, SQRT_PRICE_1_1);
+        vm.startPrank(owner);
+        h.setRegistry(r);
+        h.registerPool(k, CRWN, 100);
+        vm.stopPrank();
+        LiquidityProvider lp2 = new LiquidityProvider(fresh);
+        token.transfer(address(lp2), 10_000 ether);
+        lp2.modify(k, -600, -60, 1_000e18);
+        assertEq(address(fresh).balance, 0);
+        Swapper s2 = new Swapper(fresh);
+        vm.deal(address(s2), 10 ether);
+        BalanceDelta d = s2.swap(k, true, 1 ether);
+        assertEq(d.amount0(), -1 ether);
+        assertEq(fresh.balanceOf(address(safe), 0), 0.01 ether, "the full cut, as a claim");
+        assertEq(h.crownPaid(CRWN, ETH), 0.01 ether);
+        assertEq(address(fresh).balance, 1 ether, "the swapper's ETH backs the claim");
     }
 
     /// @dev A fresh PoolManager seeded with tokens only holds no ETH: the first buy pays no cut and
@@ -755,10 +885,9 @@ contract CrownHookTest is Test {
         assertEq(h.crownPaid(CRWN, ETH), 0.01 ether);
     }
 
-    /// @dev The hook must never block a swap, even for a beneficiary that re-enters the unlocked
-    /// PoolManager while being paid. Its payment is rolled back and the swap proceeds without the cut,
-    /// on both payment paths.
-    function test_hostileBeneficiaryCannotBlockSwapsAndIsNotPaid() public {
+    /// @dev The hook must never block a swap, whatever a beneficiary's code would do while being
+    /// paid. A beneficiary with code is credited a claim and never called, on all four swap shapes.
+    function test_hostileBeneficiaryNeverRunsAndCannotBlockSwaps() public {
         HostileBeneficiary bad = new HostileBeneficiary(manager);
         vm.mockCall(
             address(registry),
@@ -768,8 +897,9 @@ contract CrownHookTest is Test {
         for (uint8 mode; mode < 3; mode++) {
             bad.setMode(mode);
             uint256 tokensBefore = token.balanceOf(address(swapper));
-            vm.expectEmit(true, true, false, true);
-            emit CrownHook.CutSkipped(poolId, CRWN, 0.01 ether, "BENEFICIARY_REJECTED");
+            uint256 paidBefore = hook.crownPaid(CRWN, ETH);
+            vm.expectEmit(true, true, true, true);
+            emit CrownHook.CrownClaimMinted(poolId, CRWN, address(bad), 0.01 ether);
             swapper.swap(key, true, 1 ether); // exact-input buy: beforeSwap path
             assertGt(token.balanceOf(address(swapper)), tokensBefore, "exact-input buy blocked");
             uint256 ethBefore = address(swapper).balance;
@@ -777,16 +907,106 @@ contract CrownHookTest is Test {
             assertGt(address(swapper).balance, ethBefore, "exact-input sell blocked");
             swapper.swapExact(key, true, 1e18); // exact-output buy: afterSwap path
             swapper.swapExact(key, false, 0.5 ether); // exact-output sell: beforeSwap path
-            assertEq(address(bad).balance, 0, "the hostile beneficiary was paid");
-            assertEq(hook.crownPaid(CRWN, ETH), 0);
+            assertEq(bad.calls(), 0, "the beneficiary's code ran during a payment");
+            assertEq(address(bad).balance, 0, "ETH was sent to a contract");
+            assertGt(hook.crownPaid(CRWN, ETH), paidBefore + 0.01 ether, "every shape paid");
+            assertEq(manager.balanceOf(address(bad), 0), hook.crownPaid(CRWN, ETH), "claims match crownPaid");
             _assertSettledWithoutCustody();
         }
     }
 
-    /// @dev `payout` is the hook's own: nobody else can make the hook pay anyone.
+    /// @dev Round-2 finding: a beneficiary holding ETH as ERC-6909 claims could trade on the pool
+    /// inside its own payout, settling in claims so the payout's accounting checks saw nothing, and
+    /// move the price before the swapper's exact-input buy ran. Now its code never runs: the swap
+    /// fills at the quoted price, with the cut, and the beneficiary's claim grows by exactly the cut.
+    function test_claimsTradingBeneficiaryCannotFrontRunOrBlockABoundedBuy() public {
+        ClaimsTrader trader = new ClaimsTrader(manager, key);
+        vm.deal(address(trader), 60 ether);
+        trader.deposit(50 ether);
+        assertEq(manager.balanceOf(address(trader), 0), 50 ether);
+        vm.mockCall(
+            address(registry),
+            abi.encodeCall(ICrownRegistry.king, (CRWN)),
+            abi.encode(address(token), address(trader), uint64(1_000_000))
+        );
+        BoundedSwapper router = new BoundedSwapper(manager);
+        vm.deal(address(router), 10 ether);
+        uint256 snap = vm.snapshotState();
+        uint256 quoted = _abs(router.buy(key, 1 ether, 0).amount1());
+        vm.revertToState(snap);
+        (uint160 priceBefore,,,) = IPoolManager(address(manager)).getSlot0(poolId);
+
+        BalanceDelta d = router.buy(key, 1 ether, quoted * 99 / 100);
+        assertEq(_abs(d.amount1()), quoted, "the buy filled at the quoted price");
+        assertEq(trader.calls(), 0, "the beneficiary's code ran inside the swap");
+        assertEq(manager.balanceOf(address(trader), 0), 50 ether + 0.01 ether, "the cut, as a claim");
+        assertEq(manager.balanceOf(address(trader), uint256(uint160(address(token)))), 0, "no tokens bought ahead");
+        assertEq(hook.crownPaid(CRWN, ETH), 0.01 ether);
+        (uint160 priceAfter,,,) = IPoolManager(address(manager)).getSlot0(poolId);
+        assertLt(priceAfter, priceBefore, "only the swapper's own buy moved the price");
+        // A sell (afterSwap path) is paid the same way.
+        swapper.swap(key, false, 1e18);
+        assertEq(trader.calls(), 0);
+        assertEq(manager.balanceOf(address(trader), 0), 50 ether + hook.crownPaid(CRWN, ETH));
+        _assertSettledWithoutCustody();
+    }
+
+    /// @dev A contract beneficiary turns its claims into ETH through `redeem` after approving the
+    /// hook as operator, or in its own unlock; the hook holds nothing in between.
+    function test_redeemTurnsClaimsIntoEth() public {
+        ClaimsTrader safe = new ClaimsTrader(manager, key);
+        safe.setPassive(true);
+        vm.mockCall(
+            address(registry),
+            abi.encodeCall(ICrownRegistry.king, (CRWN)),
+            abi.encode(address(token), address(safe), uint64(1_000_000))
+        );
+        swapper.swap(key, true, 1 ether);
+        assertEq(manager.balanceOf(address(safe), 0), 0.01 ether);
+
+        // Without operator approval the hook cannot burn the holder's claims.
+        vm.prank(address(safe));
+        vm.expectRevert();
+        hook.redeem(0.004 ether, alice);
+
+        safe.approveHook(address(hook));
+        uint256 aliceBefore = alice.balance;
+        vm.prank(address(safe));
+        vm.expectEmit(true, true, false, true);
+        emit CrownHook.ClaimRedeemed(address(safe), alice, 0.004 ether);
+        hook.redeem(0.004 ether, alice);
+        assertEq(alice.balance - aliceBefore, 0.004 ether);
+        assertEq(manager.balanceOf(address(safe), 0), 0.006 ether);
+
+        // More than the balance, zero, or a zero recipient is refused.
+        vm.prank(address(safe));
+        vm.expectRevert();
+        hook.redeem(1 ether, alice);
+        vm.prank(address(safe));
+        vm.expectRevert(CrownHook.ZeroAmount.selector);
+        hook.redeem(0, alice);
+        vm.prank(address(safe));
+        vm.expectRevert(CrownHook.ZeroAddress.selector);
+        hook.redeem(1, address(0));
+        // Nobody but the holder can spend its claims through the hook.
+        vm.prank(alice);
+        vm.expectRevert();
+        hook.redeem(1, alice);
+
+        // A contract with its own unlock callback needs no approval at all.
+        uint256 safeBefore = address(safe).balance;
+        safe.redeemDirectly(0.006 ether);
+        assertEq(address(safe).balance - safeBefore, 0.006 ether);
+        assertEq(manager.balanceOf(address(safe), 0), 0);
+        _assertSettledWithoutCustody();
+    }
+
+    /// @dev `payout` and `unlockCallback` are the hook's own: nobody else can make the hook pay anyone.
     function test_payoutRefusesEveryoneButTheHook() public {
         vm.expectRevert(CrownHook.NotSelf.selector);
-        hook.payout(alice, 1);
+        hook.payout(alice, 1, false);
+        vm.expectRevert(CrownHook.NotPoolManager.selector);
+        hook.unlockCallback(abi.encode(alice, alice, 1));
     }
 
     /// @dev When the PoolManager holds some ETH but less than the cut, the available part is paid
