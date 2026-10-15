@@ -31,6 +31,19 @@ contract RevertingRegistry {
     }
 }
 
+/// @dev A registry stand-in whose `king` answer is 96 bytes long but carries a bit above the address
+/// in the beneficiary word, which `abi.decode` rejects.
+contract DirtyRegistry {
+    fallback() external {
+        assembly ("memory-safe") {
+            mstore(0, 0)
+            mstore(32, shl(160, 1))
+            mstore(64, 0)
+            return(0, 96)
+        }
+    }
+}
+
 /// @dev A beneficiary that refuses ETH.
 contract EthRejecter {}
 
@@ -256,7 +269,84 @@ contract CrownHookTest is Test {
         assertEq(hook.crownPaid(CRWN, ETH), (amountIn * bps) / 10_000);
     }
 
+    // ------------------------------------------------------------ the cut follows the fill, not the order
+
+    /// @dev A pool with no liquidity fills nothing, so an exact-input buy costs nothing and pays nothing.
+    function test_emptyPoolChargesNothingForAnUnfilledOrder() public {
+        PoolKey memory k = key;
+        k.fee = 3_000;
+        manager.initialize(k, SQRT_PRICE_1_1);
+        vm.prank(owner);
+        hook.registerPool(k, CRWN, 100);
+        uint256 before = kingWallet.balance;
+        BalanceDelta d = swapper.swap(k, true, 1 ether);
+        assertEq(d.amount0(), 0, "nothing was taken from the buyer");
+        assertEq(d.amount1(), 0, "nothing was bought");
+        assertEq(kingWallet.balance, before, "no cut on zero volume");
+        assertEq(hook.crownPaid(CRWN, ETH), 0);
+    }
+
+    /// @dev An exact-input buy stopped by its price limit pays the cut on the ETH the pool consumed.
+    function test_priceLimitPartialBuyPaysCutOnExecutedInput() public {
+        uint256 before = kingWallet.balance;
+        uint256 tokensBefore = token.balanceOf(address(swapper));
+        BalanceDelta d = swapper.swapWithLimit(key, true, -1 ether, uint160(uint256(SQRT_PRICE_1_1) * 9_999 / 10_000));
+        uint256 spent = _abs(d.amount0());
+        uint256 cut = kingWallet.balance - before;
+        assertGt(token.balanceOf(address(swapper)) - tokensBefore, 0, "some tokens were bought");
+        assertLt(spent, 0.2 ether, "the order was only partly filled");
+        assertGt(cut, 0);
+        assertEq(cut, ((spent - cut) * 100) / 10_000, "cut is 1% of what the pool received, not of the order");
+        assertLe(cut, spent / 100);
+        assertEq(hook.crownPaid(CRWN, ETH), cut);
+        assertEq(address(swapper).balance, 1_000 ether - spent, "the buyer paid exactly the fill plus the cut");
+    }
+
+    /// @dev An exact-output sell stopped by its price limit pays the cut on the ETH the pool delivered,
+    /// and the seller keeps the rest instead of owing the cut on ETH that never came.
+    function test_priceLimitPartialSellPaysCutOnDeliveredOutput() public {
+        uint256 before = kingWallet.balance;
+        uint256 ethBefore = address(swapper).balance;
+        BalanceDelta d = swapper.swapWithLimit(key, false, 1 ether, uint160(uint256(SQRT_PRICE_1_1) * 10_001 / 10_000));
+        uint256 received = address(swapper).balance - ethBefore;
+        uint256 cut = kingWallet.balance - before;
+        assertGt(d.amount0(), 0, "the seller received ETH");
+        assertEq(received, _abs(d.amount0()));
+        assertLt(received, 0.2 ether, "the order was only partly filled");
+        assertLt(d.amount1(), 0, "tokens were sold");
+        assertGt(cut, 0);
+        assertEq(cut, ((received + cut) * 100) / 10_000, "cut is 1% of what the pool paid out, not of the order");
+        assertEq(hook.crownPaid(CRWN, ETH), cut);
+    }
+
+    function test_simulateSwapRefusesEveryoneButTheHook() public {
+        vm.expectRevert(CrownHook.NotSelf.selector);
+        hook.simulateSwap(key, SwapParams(true, -1 ether, SQRT_PRICE_1_1 / 2));
+    }
+
     // ------------------------------------------------------------ never blocks a swap
+
+    /// @dev A 96-byte answer with a dirty beneficiary word is malformed: the swap runs without the cut.
+    function test_malformedRegistryAnswerNoCut() public {
+        CrownHook h = HookDeployer.deploy(manager, owner);
+        PoolKey memory k = PoolKey(ETH, Currency.wrap(address(token)), POOL_FEE, SPACING, IHooks(address(h)));
+        manager.initialize(k, SQRT_PRICE_1_1);
+        vm.startPrank(owner);
+        h.setRegistry(ICrownRegistry(address(new DirtyRegistry())));
+        h.registerPool(k, CRWN, 100);
+        vm.stopPrank();
+        lp.modify(k, TickMath.minUsableTick(SPACING), TickMath.maxUsableTick(SPACING), 1_000e18);
+        vm.expectEmit(true, true, false, true);
+        emit CrownHook.CutSkipped(k.toId(), CRWN, 0.01 ether, "REGISTRY_READ_FAILED");
+        BalanceDelta d = swapper.swap(k, true, 1 ether);
+        assertEq(d.amount0(), -1 ether);
+        assertGt(d.amount1(), 0);
+        assertEq(h.crownPaid(CRWN, ETH), 0);
+        // The sell direction (afterSwap path) proceeds as well.
+        d = swapper.swap(k, false, 1e18);
+        assertEq(d.amount1(), -1e18);
+        assertEq(h.crownPaid(CRWN, ETH), 0);
+    }
 
     function test_noRegistryNoCut() public {
         CrownHook bare = HookDeployer.deploy(manager, owner);

@@ -25,18 +25,28 @@ contract Swapper is IUnlockCallback {
 
     /// @notice Generic swap: negative `amountSpecified` is exact input, positive is exact output.
     function swapExact(PoolKey memory key, bool zeroForOne, int256 amountSpecified) public returns (BalanceDelta) {
-        return abi.decode(manager.unlock(abi.encode(key, zeroForOne, amountSpecified)), (BalanceDelta));
+        return swapWithLimit(
+            key, zeroForOne, amountSpecified, zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+        );
+    }
+
+    /// @notice Generic swap with an explicit price limit, so an order can be left partly unfilled.
+    function swapWithLimit(PoolKey memory key, bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96)
+        public
+        returns (BalanceDelta)
+    {
+        return
+            abi.decode(manager.unlock(abi.encode(key, zeroForOne, amountSpecified, sqrtPriceLimitX96)), (BalanceDelta));
     }
 
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         require(msg.sender == address(manager), "not manager");
-        (PoolKey memory key, bool zeroForOne, int256 amountSpecified) = abi.decode(data, (PoolKey, bool, int256));
+        (PoolKey memory key, bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) =
+            abi.decode(data, (PoolKey, bool, int256, uint160));
         BalanceDelta delta = manager.swap(
             key,
             SwapParams({
-                zeroForOne: zeroForOne,
-                amountSpecified: amountSpecified,
-                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+                zeroForOne: zeroForOne, amountSpecified: amountSpecified, sqrtPriceLimitX96: sqrtPriceLimitX96
             }),
             ""
         );

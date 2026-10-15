@@ -83,9 +83,20 @@ What happens on a swap of a registered native-ETH pool:
 
 1. Determine whether ETH (always `currency0` of a native pool) is the specified or unspecified
    amount: `(amountSpecified < 0) == zeroForOne` means specified.
-2. Compute `cut = amount × cutBps / 10,000` of the ETH amount (specified amount in `beforeSwap`,
-   `delta.amount0()` in `afterSwap`).
-3. Read `registry.king(ticker).beneficiary` with a raw staticcall.
+2. Compute `cut = amount × cutBps / 10,000` of the ETH the pool actually moves, never of the order.
+   In `afterSwap` that is `delta.amount0()`. In `beforeSwap` the pool has not run yet, so the hook
+   rehearses the exact swap the pool is about to execute (the order minus the largest possible cut
+   on a buy, plus it on a sell, at the caller's price limit): `simulateSwap` is a self-call that
+   performs `poolManager.swap` and always reverts, carrying the pool's delta back in 32 bytes of
+   revert data. If the pool fills the whole order the cut is on the order (1% of 1 ETH in is
+   0.01 ETH); if it stops short at the price limit, or the pool has no liquidity, the cut is on what
+   was filled, which for nothing filled is nothing. The PoolManager skips a hook's callbacks when
+   the hook is the swapper, so the rehearsal never re-enters the hook, and nothing it does survives
+   its revert. A rehearsal that fails (an order the pool itself will refuse) yields no cut. The cost
+   is roughly a second swap's gas on exact-input buys and exact-output sells.
+3. Read `registry.king(ticker).beneficiary` with a raw staticcall and decode the beneficiary word by
+   hand: an answer that is not exactly 96 bytes, or whose beneficiary word has bits set above the
+   address, is malformed and skips the cut (`abi.decode` would revert the swap on it).
 4. If the PoolManager's ETH balance covers it, `poolManager.take(ETH, beneficiary, cut)` pays the
    beneficiary at once, with at most `PAYOUT_GAS` (150,000) gas, and the callback returns `+cut` as
    the hook delta, so the hook's own delta nets to zero before the callback returns. The swapper pays
@@ -98,7 +109,7 @@ The hook never holds funds and never reverts a swap. Every failure path skips th
 | Reason | When |
 | --- | --- |
 | `NO_REGISTRY` | the owner has not set the registry yet |
-| `REGISTRY_READ_FAILED` | the registry read reverts or returns malformed data |
+| `REGISTRY_READ_FAILED` | the registry read reverts, or returns data that is not 96 bytes or whose beneficiary word is not a clean address |
 | `NO_KING` | the pool's ticker has no king (beneficiary is zero) |
 | `MANAGER_SHORT_OF_ETH` | the PoolManager holds less ETH than the cut (see below) |
 | `BENEFICIARY_REJECTED` | the beneficiary refuses ETH or burns more than `PAYOUT_GAS` |
@@ -121,6 +132,11 @@ Owner functions (owner = `$owner`, the launch payer; never the factory or `tx.or
 There are no other admin functions, no pause, no upgrade. The owner may `renounceOwnership()` after
 setup. Liquidity callbacks are not enabled, so the factory's zero-liquidity fee collect passes
 through untouched.
+
+External calls the hook makes, all inside the PoolManager's unlock: the registry read (staticcall),
+`poolManager.take` for the beneficiary payment, and the rehearsal self-call `simulateSwap`, which
+only the hook may invoke (`NotSelf` otherwise) and which calls `poolManager.swap` and reverts. The
+hook holds no funds and has no storage the rehearsal could touch.
 
 Wizard-style configuration record for the hook:
 
@@ -199,12 +215,15 @@ solc version). Dependencies are vendored as plain files in `lib/` (versions in `
 Uniswap v4-core, forge-std, OpenZeppelin Contracts v5.1.0, solmate's `Owned.sol` (needed by
 v4-core's `ProtocolFees`).
 
-Tests (49): `test/CrownRegistry.t.sol` (bond, reign, window, timelock, quorum boundary and tie,
+Tests (54): `test/CrownRegistry.t.sol` (bond, reign, window, timelock, quorum boundary and tie,
 exact-wei slash split for a flip, a failed challenge and a no-quorum challenge, empty winning side,
 pull claims, rejecting receiver, fuzzed conservation of funds), `test/CrownHook.t.sol` (permissions
 and address bits, caller checks, owner setters, all four swap shapes on a funded manager, fuzzed
-cut, every skip reason including a fresh tokens-only PoolManager and a rejecting beneficiary, the
-end-to-end dethrone, a zero-liquidity collect), `test/CrownToken.t.sol`, `test/DeployCrown.t.sol`.
+cut, an unfilled order in an empty pool and price-limited partial fills in both directions paying
+the cut only on the executed ETH, the rehearsal refusing outside callers, every skip reason
+including a malformed registry answer, a fresh tokens-only PoolManager and a rejecting
+beneficiary, the end-to-end dethrone, a zero-liquidity collect), `test/CrownToken.t.sol`,
+`test/DeployCrown.t.sol`.
 `test/mocks` and `test/floor` hold the routers and owner checks the floor suite imports.
 
 ## Assumptions and open points

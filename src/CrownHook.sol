@@ -29,6 +29,12 @@ import {ICrownRegistry} from "./interfaces/ICrownRegistry.sol";
 /// specified amount (exact-input buy, exact-output sell) it is taken in `beforeSwap` through the
 /// specified return delta; when ETH is the unspecified amount (exact-output buy, exact-input sell)
 /// it is taken in `afterSwap` through the unspecified return delta. The launch token is never touched.
+///
+/// The cut follows the ETH the pool actually moves, never the order. In `afterSwap` that is the
+/// swap's own delta. In `beforeSwap` the pool has not run yet, so the hook rehearses the exact swap
+/// the pool is about to execute (`simulateSwap`, a self-call that always reverts and carries the
+/// pool's delta back in its revert data): a partially filled order at its price limit, or one in a
+/// pool without liquidity, pays the cut on what was filled, which for no fill is nothing.
 contract CrownHook is IHooks, Ownable {
     using PoolIdLibrary for PoolKey;
 
@@ -42,6 +48,8 @@ contract CrownHook is IHooks, Ownable {
     /// @notice Gas forwarded to the PoolManager for the beneficiary payment. Bounds what a hostile
     /// beneficiary can burn inside somebody else's swap; a plain wallet or a multisig needs far less.
     uint256 public constant PAYOUT_GAS = 150_000;
+    /// @notice Largest ETH amount the hook quotes a cut on; a swap beyond it cannot settle in v4 anyway.
+    uint256 public constant MAX_AMOUNT = uint256(uint128(type(int128).max));
 
     // ---------------------------------------------------------------- types
 
@@ -71,6 +79,7 @@ contract CrownHook is IHooks, Ownable {
     // ---------------------------------------------------------------- errors
 
     error NotPoolManager();
+    error NotSelf();
     error HookNotImplemented();
     error RegistryAlreadySet();
     error PoolNotInitialized();
@@ -152,6 +161,7 @@ contract CrownHook is IHooks, Ownable {
     }
 
     /// @dev Takes the cut when ETH is the specified amount: exact-input buys and exact-output sells.
+    /// The cut is on the ETH the pool will actually move (see `_fillableEth`), not on the order.
     function beforeSwap(address, PoolKey calldata key, SwapParams calldata params, bytes calldata)
         external
         onlyPoolManager
@@ -160,9 +170,22 @@ contract CrownHook is IHooks, Ownable {
         if (!_ethIsSpecified(params)) {
             return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
         }
-        uint256 amount = params.amountSpecified < 0 ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
-        uint256 paid = _payCut(key, amount);
+        uint256 amount = _abs(params.amountSpecified);
+        uint256 paid = _payCut(key, _fillableEth(key, params, amount));
         return (IHooks.beforeSwap.selector, toBeforeSwapDelta(int128(uint128(paid)), 0), 0);
+    }
+
+    /// @notice Rehearses `params` on `key` and reverts with the pool's delta as 32 bytes of revert data.
+    /// Only the hook itself may call it, from `beforeSwap`; nothing it does survives, since it always
+    /// reverts. The PoolManager skips a hook's callbacks when the hook is the swapper, so the rehearsal
+    /// never re-enters this contract.
+    function simulateSwap(PoolKey calldata key, SwapParams calldata params) external {
+        if (msg.sender != address(this)) revert NotSelf();
+        int256 raw = BalanceDelta.unwrap(poolManager.swap(key, params, ""));
+        assembly ("memory-safe") {
+            mstore(0, raw)
+            revert(0, 32)
+        }
     }
 
     /// @dev Takes the cut when ETH is the unspecified amount: exact-output buys and exact-input sells.
@@ -172,9 +195,7 @@ contract CrownHook is IHooks, Ownable {
         returns (bytes4, int128)
     {
         if (_ethIsSpecified(params)) return (IHooks.afterSwap.selector, 0);
-        int128 eth = delta.amount0();
-        uint256 amount = eth < 0 ? uint256(uint128(-eth)) : uint256(uint128(eth));
-        uint256 paid = _payCut(key, amount);
+        uint256 paid = _payCut(key, _abs(delta.amount0()));
         return (IHooks.afterSwap.selector, int128(uint128(paid)));
     }
 
@@ -245,15 +266,47 @@ contract CrownHook is IHooks, Ownable {
         return (params.amountSpecified < 0) == params.zeroForOne;
     }
 
+    /// @dev Magnitude of a signed amount; `type(int).min` maps to 2^255 (or 2^127) instead of reverting.
+    function _abs(int256 x) internal pure returns (uint256) {
+        unchecked {
+            return x < 0 ? uint256(-x) : uint256(x);
+        }
+    }
+
+    /// @dev The ETH the pool will actually move for an order of `amount` ETH on its specified side.
+    /// Rehearses the swap the pool is about to run under the largest cut the order could carry: if
+    /// the pool fills all of it the cut is on the order; if it stops short (price limit, no liquidity)
+    /// the cut is on what it filled. A rehearsal that fails (an order the pool itself will refuse)
+    /// yields no cut, so the hook never blocks a swap.
+    function _fillableEth(PoolKey calldata key, SwapParams calldata params, uint256 amount) internal returns (uint256) {
+        if (amount > MAX_AMOUNT) return amount;
+        uint256 cut = quoteCut(key.toId(), amount);
+        if (cut == 0) return amount;
+        bool exactInput = params.amountSpecified < 0;
+        uint256 poolAmount = exactInput ? amount - cut : amount + cut;
+        SwapParams memory trial = SwapParams({
+            zeroForOne: params.zeroForOne,
+            amountSpecified: exactInput ? -int256(poolAmount) : int256(poolAmount),
+            sqrtPriceLimitX96: params.sqrtPriceLimitX96
+        });
+        try this.simulateSwap(key, trial) {
+            return 0;
+        } catch (bytes memory result) {
+            if (result.length != 32) return 0;
+            uint256 moved = _abs(BalanceDelta.wrap(abi.decode(result, (int256))).amount0());
+            return moved < poolAmount ? moved : amount;
+        }
+    }
+
     /// @dev Pays the cut on `amount` ETH to the king's beneficiary; returns what was actually paid.
     /// Never reverts: every failure path returns 0 and the swap runs without the cut.
     function _payCut(PoolKey calldata key, uint256 amount) internal returns (uint256) {
         PoolId id = key.toId();
         PoolConfig storage p = pools[id];
         bytes32 ticker = p.ticker;
-        if (ticker == bytes32(0) || !key.currency0.isAddressZero()) return 0;
+        if (ticker == bytes32(0) || !key.currency0.isAddressZero() || amount > MAX_AMOUNT) return 0;
         uint256 cut = (amount * p.cutBps) / BPS;
-        if (cut == 0 || cut > uint256(uint128(type(int128).max))) return 0;
+        if (cut == 0) return 0;
 
         ICrownRegistry reg = registry;
         if (address(reg) == address(0)) {
@@ -263,11 +316,22 @@ contract CrownHook is IHooks, Ownable {
         // A raw staticcall: a revert, an empty answer or a malformed one all skip the cut instead
         // of reverting the swap (a high-level try/catch would still revert on bad return data).
         (bool ok, bytes memory data) = address(reg).staticcall(abi.encodeCall(ICrownRegistry.king, (ticker)));
-        if (!ok || data.length != 96) {
+        address beneficiary;
+        bool wellFormed = ok && data.length == 96;
+        if (wellFormed) {
+            // The beneficiary is the second word. It is read by hand rather than with `abi.decode`,
+            // which reverts on a word with bits set above the address; such an answer is malformed.
+            uint256 word;
+            assembly ("memory-safe") {
+                word := mload(add(data, 64))
+            }
+            wellFormed = (word >> 160) == 0;
+            beneficiary = address(uint160(word));
+        }
+        if (!wellFormed) {
             emit CutSkipped(id, ticker, cut, "REGISTRY_READ_FAILED");
             return 0;
         }
-        (, address beneficiary,) = abi.decode(data, (address, address, uint64));
         if (beneficiary == address(0)) {
             emit CutSkipped(id, ticker, cut, "NO_KING");
             return 0;
