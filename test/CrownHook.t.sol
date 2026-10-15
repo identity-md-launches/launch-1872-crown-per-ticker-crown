@@ -13,6 +13,7 @@ import {Currency} from "v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {CrownHook} from "../src/CrownHook.sol";
@@ -59,6 +60,7 @@ contract GasBurningBeneficiary {
 contract CrownHookTest is Test {
     using PoolIdLibrary for PoolKey;
     using TransientStateLibrary for IPoolManager;
+    using StateLibrary for IPoolManager;
 
     uint160 constant SQRT_PRICE_1_1 = 79228162514264337593543950336;
     uint24 constant POOL_FEE = 12_500;
@@ -336,6 +338,132 @@ contract CrownHookTest is Test {
         hook.simulateSwap(key, SwapParams(true, -1 ether, SQRT_PRICE_1_1 / 2));
     }
 
+    /// @dev The afterSwap shapes (token specified) also pay on executed ETH only when a price limit
+    /// stops the order short: exact-output buy and exact-input sell.
+    function test_priceLimitPartialExactOutputBuyPaysCutOnExecutedInput() public {
+        uint256 before = kingWallet.balance;
+        BalanceDelta d = swapper.swapWithLimit(key, true, 1e18, uint160(uint256(SQRT_PRICE_1_1) * 9_999 / 10_000));
+        uint256 spent = _abs(d.amount0());
+        uint256 cut = kingWallet.balance - before;
+        assertGt(d.amount1(), 0, "some tokens were bought");
+        assertLt(d.amount1(), 1e18, "the order was only partly filled");
+        assertGt(cut, 0);
+        assertEq(cut, ((spent - cut) * 100) / 10_000, "cut is 1% of what the pool received");
+        assertEq(hook.crownPaid(CRWN, ETH), cut);
+    }
+
+    function test_priceLimitPartialExactInputSellPaysCutOnDeliveredOutput() public {
+        uint256 before = kingWallet.balance;
+        BalanceDelta d = swapper.swapWithLimit(key, false, -1e18, uint160(uint256(SQRT_PRICE_1_1) * 10_001 / 10_000));
+        uint256 received = _abs(d.amount0());
+        uint256 cut = kingWallet.balance - before;
+        assertGt(_abs(d.amount1()), 0, "some tokens were sold");
+        assertLt(_abs(d.amount1()), 1e18, "the order was only partly filled");
+        assertGt(cut, 0);
+        assertEq(cut, ((received + cut) * 100) / 10_000, "cut is 1% of what the pool paid out");
+        assertEq(hook.crownPaid(CRWN, ETH), cut);
+    }
+
+    /// @dev No liquidity, any shape: nothing moves and nothing is charged. An empty pool's price runs
+    /// to the limit on each swap, so the directions alternate.
+    function test_emptyPoolChargesNothingInAnyShape() public {
+        PoolKey memory k = key;
+        k.fee = 3_000;
+        manager.initialize(k, SQRT_PRICE_1_1);
+        vm.prank(owner);
+        hook.registerPool(k, CRWN, 100);
+        uint256 before = kingWallet.balance;
+        assertEq(BalanceDelta.unwrap(swapper.swap(k, true, 1 ether)), 0);
+        assertEq(BalanceDelta.unwrap(swapper.swap(k, false, 1e18)), 0);
+        assertEq(BalanceDelta.unwrap(swapper.swapExact(k, true, 1e18)), 0);
+        assertEq(BalanceDelta.unwrap(swapper.swapExact(k, false, 1 ether)), 0);
+        assertEq(kingWallet.balance, before);
+        assertEq(hook.crownPaid(CRWN, ETH), 0);
+        _assertSettledWithoutCustody();
+    }
+
+    /// @dev The rehearsal must leave no trace: a 1 ETH buy on the hooked pool lands the pool exactly
+    /// where a 0.99 ETH buy lands an identical pool without a hook (price, tick, output, LP fee growth),
+    /// and an exact-output sell of 1 ETH matches a plain sell of 1.01 ETH.
+    function test_rehearsalLeavesNoTraceOnThePool() public {
+        PoolKey memory plain = key;
+        plain.hooks = IHooks(address(0));
+        manager.initialize(plain, SQRT_PRICE_1_1);
+        lp.modify(plain, TickMath.minUsableTick(SPACING), TickMath.maxUsableTick(SPACING), 1_000e18);
+        IPoolManager m = IPoolManager(address(manager));
+
+        BalanceDelta a = swapper.swap(key, true, 1 ether);
+        BalanceDelta b = swapper.swap(plain, true, 0.99 ether);
+        (uint160 pa, int24 ta,,) = m.getSlot0(poolId);
+        (uint160 pb, int24 tb,,) = m.getSlot0(plain.toId());
+        assertEq(pa, pb, "price");
+        assertEq(ta, tb, "tick");
+        assertEq(a.amount1(), b.amount1(), "token output");
+        (uint256 fa,) = m.getFeeGrowthGlobals(poolId);
+        (uint256 fb,) = m.getFeeGrowthGlobals(plain.toId());
+        assertEq(fa, fb, "LP fee growth in ETH");
+
+        a = swapper.swapExact(key, false, 1 ether);
+        b = swapper.swapExact(plain, false, 1.01 ether);
+        (pa,,,) = m.getSlot0(poolId);
+        (pb,,,) = m.getSlot0(plain.toId());
+        assertEq(pa, pb, "price after the sell");
+        assertEq(a.amount1(), b.amount1(), "tokens sold");
+        assertEq(hook.crownPaid(CRWN, ETH), 0.02 ether);
+        _assertSettledWithoutCustody();
+    }
+
+    /// @dev A rehearsal that runs out of gas yields no cut, so a swapper might try to starve it and
+    /// still complete the trade. Whatever gas is forwarded, either the swap reverts or the cut is paid.
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_noGasLimitLetsASwapThroughWithoutTheCut(uint256 gas) public {
+        gas = bound(gas, 30_000, 600_000);
+        uint256 before = kingWallet.balance;
+        try swapper.swap{gas: gas}(key, true, 1 ether) returns (BalanceDelta d) {
+            assertEq(d.amount0(), -1 ether);
+            assertEq(kingWallet.balance - before, 0.01 ether, "a swap went through without the cut");
+            assertEq(hook.crownPaid(CRWN, ETH), 0.01 ether);
+        } catch {
+            assertEq(kingWallet.balance, before);
+            assertEq(hook.crownPaid(CRWN, ETH), 0);
+        }
+        _assertSettledWithoutCustody();
+    }
+
+    /// @dev Random price limits in all four shapes. On a full fill of an ETH-specified order the cut is
+    /// bps of the order; otherwise it is bps of the ETH the pool moved. Either way it lies between bps
+    /// of the user's ETH and bps of the pool's ETH, and never exceeds bps of the ETH the user put up.
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_cutFollowsExecutedEthUnderAnyPriceLimit(uint256 amount, uint16 limitBps, uint8 shape) public {
+        amount = bound(amount, 1e12, 50 ether);
+        limitBps = uint16(bound(limitBps, 1, 2_000));
+        shape %= 4;
+        bool buy = shape < 2;
+        bool exactOutput = shape % 2 == 1;
+        uint160 limit = buy
+            ? uint160(uint256(SQRT_PRICE_1_1) * (10_000 - limitBps) / 10_000)
+            : uint160(uint256(SQRT_PRICE_1_1) * (10_000 + limitBps) / 10_000);
+        uint256 before = kingWallet.balance;
+        uint256 ethBefore = address(swapper).balance;
+        BalanceDelta d = swapper.swapWithLimit(key, buy, exactOutput ? int256(amount) : -int256(amount), limit);
+        uint256 cut = kingWallet.balance - before;
+        uint256 userEth = _abs(d.amount0());
+        uint256 poolEth = buy ? userEth - cut : userEth + cut;
+        bool ethSpecified = buy != exactOutput;
+        if (ethSpecified && userEth == amount) {
+            assertEq(cut, amount / 100, "full fill: 1% of the specified ETH");
+        } else {
+            assertEq(cut, poolEth / 100, "partial fill or token-specified: 1% of the ETH the pool moved");
+        }
+        (uint256 lo, uint256 hi) = userEth < poolEth ? (userEth, poolEth) : (poolEth, userEth);
+        assertGe(cut, lo / 100);
+        assertLe(cut, hi / 100);
+        if (buy) assertEq(ethBefore - address(swapper).balance, userEth, "buyer paid exactly the delta");
+        else assertEq(address(swapper).balance - ethBefore, userEth, "seller received exactly the delta");
+        assertEq(hook.crownPaid(CRWN, ETH), cut);
+        _assertSettledWithoutCustody();
+    }
+
     // ------------------------------------------------------------ never blocks a swap
 
     /// @dev A 96-byte answer with a dirty beneficiary word is malformed: the swap runs without the cut.
@@ -403,12 +531,16 @@ contract CrownHookTest is Test {
         assertEq(h.crownPaid(CRWN, ETH), 0);
     }
 
+    /// @dev Every reply length skips the cut and lets both callbacks through. A 96-byte reply of zeros
+    /// is well formed with no king (`NO_KING`); every other length is `REGISTRY_READ_FAILED`.
     /// forge-config: default.fuzz.runs = 1000
-    function testFuzz_wrongLengthRegistryResponsesSkipBothCallbacks(uint8 lengthSeed) public {
+    function testFuzz_anyLengthRegistryResponseSkipsBothCallbacks(uint8 lengthSeed) public {
         uint256 length = bound(lengthSeed, 0, 192);
-        // A malformed 96-byte response is reported separately: abi.decode currently reverts.
-        if (length == 96) length = 97;
         vm.mockCall(address(registry), abi.encodeCall(ICrownRegistry.king, (CRWN)), new bytes(length));
+        vm.expectEmit(true, true, false, true);
+        emit CrownHook.CutSkipped(
+            poolId, CRWN, 0.01 ether, length == 96 ? bytes32("NO_KING") : bytes32("REGISTRY_READ_FAILED")
+        );
         uint256 before = kingWallet.balance;
         BalanceDelta d = swapper.swap(key, true, 1 ether);
         assertEq(d.amount0(), -1 ether);

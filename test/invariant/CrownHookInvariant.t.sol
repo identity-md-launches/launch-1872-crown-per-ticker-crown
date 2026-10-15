@@ -11,6 +11,7 @@ import {Currency} from "v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {CrownHook} from "src/CrownHook.sol";
 import {CrownRegistry} from "src/CrownRegistry.sol";
 import {CrownToken} from "src/CrownToken.sol";
@@ -19,10 +20,11 @@ import {HookDeployer} from "../utils/HookDeployer.sol";
 import {Swapper} from "../mocks/Swapper.sol";
 import {LiquidityProvider} from "../mocks/LiquidityProvider.sol";
 
-/// @dev Random full fills in all four swap shapes, interspersed with successful and failed
-/// challenges. Partial/empty fills have separate failing proofs in the findings report.
+/// @dev Random full fills and price-limited partial fills in all four swap shapes, interspersed with
+/// successful and failed challenges.
 contract CrownHookHandler is Test {
     using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
     bytes32 constant TICKER = keccak256("CRWN");
     Currency constant ETH = Currency.wrap(address(0));
     CrownRegistry public immutable registry;
@@ -43,6 +45,7 @@ contract CrownHookHandler is Test {
     uint256 public registryClaims;
     uint256 public treasuryPaid;
     uint256 public swaps;
+    uint256 public partialSwaps;
     uint256 public flips;
     uint256 public failedChallenges;
 
@@ -77,8 +80,8 @@ contract CrownHookHandler is Test {
     }
 
     function _swap(bool buy_, bool exactOutput, uint96 amountSeed) internal {
-        // Full-range liquidity and small orders keep these sequences in the full-fill domain.
-        // Across 96 calls neither side can consume the router's 1,000-unit funding.
+        // Full-range liquidity and small orders keep these calls in the full-fill domain (limited
+        // fills are `_swapLimited`). Across 96 calls neither side can consume the router's funding.
         uint256 amount = bound(amountSeed, 1e9, 1 ether);
         uint256[2] memory before = [wallets[0].balance, wallets[1].balance];
         uint256 ethBefore = address(swapper).balance;
@@ -108,6 +111,71 @@ contract CrownHookHandler is Test {
         totalPaid += fee;
         paidTo[currentWallet] += fee;
         swaps++;
+    }
+
+    function buyLimited(uint96 amountSeed, uint16 limitSeed, bool exactOutput) public {
+        _swapLimited(true, exactOutput, amountSeed, limitSeed);
+    }
+
+    function sellLimited(uint96 amountSeed, uint16 limitSeed, bool exactOutput) public {
+        _swapLimited(false, exactOutput, amountSeed, limitSeed);
+    }
+
+    /// @dev A price limit a few bps away from the current price: most orders stop short of it. On a
+    /// full fill of an ETH-specified order the cut is bps of the order; on anything else it is bps of
+    /// the ETH the pool actually moved. The beneficiary is paid exactly that, and nobody else.
+    function _swapLimited(bool buy_, bool exactOutput, uint96 amountSeed, uint16 limitSeed) internal {
+        uint256 amount = bound(amountSeed, 1e9, 1 ether);
+        uint256[4] memory before = _balances();
+        BalanceDelta d = swapper.swapWithLimit(
+            key, buy_, exactOutput ? int256(amount) : -int256(amount), _limitFor(buy_, bound(limitSeed, 1, 300))
+        );
+        uint256 fee = _checkSettlement(buy_, d, before);
+        uint256 userEth = _abs(d.amount0());
+        uint256 poolEth = buy_ ? userEth - fee : userEth + fee;
+        bool ethSpecified = buy_ != exactOutput;
+        bool fullFill = ethSpecified ? userEth == amount : _abs(d.amount1()) == amount;
+        if (ethSpecified && fullFill) assertEq(fee, amount / 100, "full fill: 1% of the order");
+        else assertEq(fee, poolEth / 100, "1% of the ETH the pool moved");
+        if (!fullFill) partialSwaps++;
+        totalPaid += fee;
+        paidTo[currentWallet] += fee;
+        swaps++;
+    }
+
+    function _limitFor(bool buy_, uint256 limitBps) internal view returns (uint160) {
+        (uint160 price,,,) = hook.poolManager().getSlot0(key.toId());
+        return buy_
+            ? uint160(uint256(price) * (10_000 - limitBps) / 10_000)
+            : uint160(uint256(price) * (10_000 + limitBps) / 10_000);
+    }
+
+    /// @dev [king wallet, challenger wallet, router ETH, router tokens] plus the manager's ETH in slot 4.
+    function _balances() internal view returns (uint256[4] memory b) {
+        b[0] = wallets[0].balance;
+        b[1] = wallets[1].balance;
+        b[2] = address(swapper).balance + (address(hook.poolManager()).balance << 128);
+        b[3] = token.balanceOf(address(swapper));
+    }
+
+    /// @dev The swapper moved exactly its delta, the manager's ETH changed by the delta minus the fee,
+    /// and only the current beneficiary was paid. Returns the fee.
+    function _checkSettlement(bool buy_, BalanceDelta d, uint256[4] memory before) internal view returns (uint256 fee) {
+        fee = wallets[currentWallet].balance - before[currentWallet];
+        assertEq(wallets[1 - currentWallet].balance, before[1 - currentWallet], "only current beneficiary is paid");
+        uint256 userEth = _abs(d.amount0());
+        uint256 routerBefore = uint128(before[2]);
+        uint256 managerBefore = before[2] >> 128;
+        uint256 managerNow = address(hook.poolManager()).balance;
+        if (buy_) {
+            assertEq(routerBefore - address(swapper).balance, userEth);
+            assertEq(token.balanceOf(address(swapper)) - before[3], _abs(d.amount1()));
+            assertEq(managerNow + fee, managerBefore + userEth);
+        } else {
+            assertEq(address(swapper).balance - routerBefore, userEth);
+            assertEq(before[3] - token.balanceOf(address(swapper)), _abs(d.amount1()));
+            assertEq(managerNow + fee + userEth, managerBefore);
+        }
     }
 
     function resolveChallenge(bool challengerWins, uint96 stakeSeed) public {
@@ -216,10 +284,12 @@ contract CrownHookInvariantTest is Test {
         handler = new CrownHookHandler(registry, hook, token, rival, swapper, key, first, second);
         // Every run starts with an actual fee payment; random sequences exercise both recipients.
         handler.buy(1 ether, false);
-        bytes4[] memory selectors = new bytes4[](3);
+        bytes4[] memory selectors = new bytes4[](5);
         selectors[0] = handler.buy.selector;
         selectors[1] = handler.sell.selector;
         selectors[2] = handler.resolveChallenge.selector;
+        selectors[3] = handler.buyLimited.selector;
+        selectors[4] = handler.sellLimited.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector(address(handler), selectors));
     }
@@ -256,8 +326,12 @@ contract CrownHookInvariantTest is Test {
         handler.resolveChallenge(false, 0.05 ether);
         handler.resolveChallenge(true, 0.05 ether);
         handler.buy(1 ether, false);
+        // A partial fill in every sequence, so the rehearsal path is always under the invariants.
+        handler.buyLimited(1 ether, 1, false);
+        handler.sellLimited(1 ether, 1, true);
         handler.assertPaymentAccounting();
         invariant_hookRetainsNoValueOrSettlementDebt();
+        assertGt(handler.partialSwaps(), 0);
         assertGt(handler.flips(), 0);
         assertGt(handler.failedChallenges(), 0);
         assertGt(handler.swaps(), 1);
