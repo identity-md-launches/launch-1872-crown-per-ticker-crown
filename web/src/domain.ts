@@ -16,6 +16,8 @@ export type Challenge = {
   kingStake: bigint;
   challengerStake: bigint;
   winnerBonus: bigint;
+  bond: bigint;
+  displacedBy: bigint;
 };
 export const eth = (n: bigint | undefined) =>
   n === undefined ? "Not live" : formatEther(n);
@@ -84,8 +86,9 @@ export function friendly(error: unknown) {
     ReignTooYoung: "The seven-day minimum reign has not ended.",
     InCooldown: "This ticker is still in its three-day challenge cooldown.",
     ChallengeLive:
-      "A challenge is already open. Refresh and stake on that challenge.",
-    WrongBond: "Opening a challenge requires exactly 0.01 ETH.",
+      "The live challenge is past its staking window. It must be finalized before another can open.",
+    WrongBond:
+      "The opening bond is 0.01 ETH, or exactly twice the live challenge’s bond to displace it. Refresh and retry.",
     WindowClosed:
       "The staking window has closed. Refresh to see the next step.",
     TooEarly: "The 24-hour timelock has not ended.",

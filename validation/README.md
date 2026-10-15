@@ -1,6 +1,49 @@
 # Frontend validation
 
-Recorded 2026-10-15 against the final `web/` source and root `dist/` export. The accepted Solidity implementation, dependencies and Foundry configuration were preserved. This record concerns the implemented ticker frontend and local checks, not deployment or an independent contract audit.
+## Revision of 2026-10-15 (findings round)
+
+This revision answers six reviewer findings (`.imd-responses.json`): a hostile beneficiary that could
+block every swap, the sham-challenge lock on the ticker, the owner-chosen registry and unused default
+cut, the all-or-nothing cut on a short PoolManager, floor-rounding dust, and `registerPool` accepting
+squatted tickers. The contract changes (`src/CrownHook.sol`, `src/CrownRegistry.sol`) are described in
+the README; the frontend changed only where the contracts did. Everything below was re-run on the
+final source and the rebuilt `dist/` export.
+
+| Check | Result |
+| --- | --- |
+| `forge build` | Pass with the pinned Solidity 0.8.26 settings. |
+| Seeded `forge test` | **82 passed, 0 failed, 0 skipped** in the delivered tree (83 with the reviewer's proof copied under `test/scratch/`, which now passes). New: hostile beneficiary on all four swap shapes, `payout` self-call guard, partial cut on a short manager, registry code-hash binding, king-owns-pool registration guard, challenge displacement; the registry invariant handler models the displacement bond rule. |
+| Reviewer proof `Proof_3cf0264adc30.t.sol` | Failed on the starting tree with `CurrencyNotSettled()`; **passes** on this tree. |
+| Production build and `tsc --noEmit` | Pass (`node web/scripts/build-worker.mjs`). |
+| Chromium test run | **12 passed, 0 failed**: seven browser tests, four domain tests, one export test, against the rebuilt export with the regenerated ABIs (the fixture now serves `requiredBond` and the two new `Challenge` fields). |
+| WebKit test run | Not repeated in this revision (no WebKit runtime on this worker); the earlier WebKit run below predates the revision. |
+| Pinned design-critic probe | **16 of 16 passed** on the rebuilt export; output replaced in [taste.json](taste.json). The 390-wide screenshot shows the product, the wallet control and the "Open challenge" action on the first screen. |
+| Export verification | Pass: **20 assets, 1,554,436 bytes** excluding the manifest; SHA-256 inventory, ABI bindings, allowed manifest keys and relative base verified after the final build. |
+
+Frontend changes in this revision, reviewed against the six Better Interface domains:
+
+- `web/src/data.ts`, `web/src/domain.ts`: read the registry's `requiredBond(ticker)`; the `Challenge`
+  type carries `bond` and `displacedBy`; the `WrongBond` and `ChallengeLive` translations now say what
+  the bond must be and when the slot is closed (writing: the direction sits beside the control).
+- `web/src/ChallengePanel.tsx`: the open-challenge control sends `requiredBond` instead of a fixed
+  0.01 ETH, is disabled while `requiredBond` is zero (live challenge past its window), and during the
+  staking window the same form is offered under a native disclosure "Displace this challenge
+  (… ETH bond)" whose review text states the doubled bond, the full refunds of the displaced
+  challenge and the new window (UI: native details, no new card; accessibility: the disclosure is a
+  real `summary` with a 44-pixel hit area; layout: it stacks under the stake form, nothing scrolls
+  sideways at 320 or 390 in the probe).
+- `web/src/App.tsx`: how-it-works step 02 and the rules disclosure explain displacement in plain
+  English.
+- `web/public/abi/*.json` and `dist/abi/*.json`: regenerated from the new Foundry build (`CrownHook`
+  gains `payout`, the code-hash immutables and the new errors; `CrownRegistry`/`ThroneRegistry` gain
+  `requiredBond`, `ChallengeDisplaced` and the struct fields).
+
+Not exercised in this revision: a real wallet on Robinhood Chain (no deployment handoff yet), a
+displacement signed by a real wallet (the mocked fixture validates the sent value against
+`requiredBond` only through the open-challenge path), and WebKit. These are limitations of this
+worker, not failed checks.
+
+Recorded 2026-10-15 (first round) against the then-final `web/` source and root `dist/` export; the revision section above supersedes its counts. The accepted Solidity implementation, dependencies and Foundry configuration were preserved. This record concerns the implemented ticker frontend and local checks, not deployment or an independent contract audit.
 
 ## Results
 

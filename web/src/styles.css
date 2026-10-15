@@ -641,6 +641,7 @@ input::placeholder {
   margin-top: 20px;
 }
 .compact-details summary,
+.displace-details summary,
 .rules-details summary {
   cursor: pointer;
   padding-block: 12px;
@@ -683,6 +684,10 @@ input::placeholder {
 .rules-details {
   margin-top: 16px;
   max-width: 76ch;
+}
+.displace-details {
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
 }
 .rules-details p {
   font-size: var(--small);

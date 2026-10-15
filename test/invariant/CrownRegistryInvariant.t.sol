@@ -73,7 +73,10 @@ contract CrownRegistryHandler is Test {
         uint256 a = actorSeed % 4;
         address candidate = expectedKing[t] == tokens[0] ? tokens[1] : tokens[0];
         bytes memory reason;
-        if (live[t] != 0) {
+        if (live[t] != 0 && block.timestamp < rounds[live[t]].opened + 72 hours) {
+            // A live challenge in its window can only be displaced with twice its bond (never done here).
+            reason = abi.encodeWithSelector(CrownRegistry.WrongBond.selector, 0.01 ether, 0.02 ether);
+        } else if (live[t] != 0) {
             reason = abi.encodeWithSelector(CrownRegistry.ChallengeLive.selector, tickers[t], live[t]);
         } else if (block.timestamp < expectedReign[t] + 7 days) {
             reason = abi.encodeWithSelector(CrownRegistry.ReignTooYoung.selector, uint64(expectedReign[t] + 7 days));

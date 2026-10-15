@@ -32,6 +32,7 @@ export type State = {
   myKing: bigint;
   myChallenger: bigint;
   bond: bigint;
+  requiredBond: bigint;
   quorum: bigint;
   minReign: bigint;
   verified: boolean;
@@ -100,6 +101,7 @@ export async function readState(
     decimals,
     symbol,
     bond,
+    requiredBond,
     quorum,
     minReign,
     pool,
@@ -118,6 +120,7 @@ export async function readState(
     read(token, "decimals"),
     read(token, "symbol"),
     read(registry, "BOND"),
+    read(registry, "requiredBond", [TICKER]),
     read(registry, "QUORUM"),
     read(registry, "MIN_REIGN"),
     r.pool ? read(hook, "pools", [poolId(r)]) : undefined,
@@ -150,6 +153,7 @@ export async function readState(
     decimals: Number(decimals),
     symbol: String(symbol),
     bond: bond as bigint,
+    requiredBond: requiredBond as bigint,
     quorum: quorum as bigint,
     minReign: minReign as bigint,
     pool: pool as State["pool"],

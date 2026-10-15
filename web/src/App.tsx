@@ -287,7 +287,8 @@ export default function App({ r }: { r: Runtime }) {
               <p>
                 After a seven-day reign, anyone can bond 0.01 ETH to challenge
                 with a different token. The caller becomes its beneficiary if it
-                wins.
+                wins. While a challenge is still taking stakes, a rival can
+                displace it by bonding twice its bond.
               </p>
             </article>
             <article>
@@ -322,6 +323,12 @@ export default function App({ r }: { r: Runtime }) {
               A failed challenge starts a three-day cooldown. A successful
               challenge starts a new seven-day reign. There is no admin override
               of the result.
+            </p>
+            <p>
+              A displaced challenge ends at once: nothing is slashed, no
+              cooldown starts, and every stake on both sides can be claimed back
+              in full. The displacing bond doubles each time, so a sham
+              challenge opened to block rivals cannot hold the slot for free.
             </p>
             <p>
               Crown fees are never stored in the hook. If its registry read or

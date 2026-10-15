@@ -159,6 +159,12 @@ function readResult(s, to, f, args) {
     symbol: () => "CRWN",
     name: () => "Crown Demo",
     BOND: () => parseEther("0.01"),
+    requiredBond: () =>
+      s.c && !s.c.finalized
+        ? s.time < s.c.windowEnd
+          ? s.c.bond * 2n
+          : 0n
+        : parseEther("0.01"),
     QUORUM: () => parseEther("0.05"),
     MIN_REIGN: () => 7n * 86400n,
     pools: () => [true, s.registered ? ticker : empty, 100],
@@ -178,6 +184,8 @@ function readResult(s, to, f, args) {
         kingStake: 0n,
         challengerStake: 0n,
         winnerBonus: 0n,
+        bond: 0n,
+        displacedBy: 0n,
       },
     claimable: () =>
       s.c?.finalized && !s.claimed
@@ -221,6 +229,8 @@ function apply(s, tx) {
       kingStake: 0n,
       challengerStake: value,
       winnerBonus: 0n,
+      bond: value,
+      displacedBy: 0n,
     };
     s.challengerEver += value;
   }

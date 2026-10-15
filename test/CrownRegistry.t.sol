@@ -159,9 +159,78 @@ contract CrownRegistryTest is Test {
 
     function test_oneLiveChallengePerTicker() public {
         uint256 id = _open();
+        // In the window a plain bond is refused: the slot is taken, displacing it costs twice its bond.
+        assertEq(registry.requiredBond(CRWN), 0.02 ether);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(CrownRegistry.WrongBond.selector, 0.01 ether, 0.02 ether));
+        registry.openChallenge{value: 0.01 ether}(CRWN, address(0x4444));
+        // Past the window the live challenge is being decided and nothing can be opened.
+        vm.warp(registry.challenges(id).windowEnd);
+        assertEq(registry.requiredBond(CRWN), 0);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(CrownRegistry.ChallengeLive.selector, CRWN, id));
+        registry.openChallenge{value: 0.02 ether}(CRWN, address(0x4444));
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(CrownRegistry.ChallengeLive.selector, CRWN, id));
         registry.openChallenge{value: 0.01 ether}(CRWN, address(0x4444));
+    }
+
+    /// @dev A sham challenge the king opens against itself (equal stakes on both sides, so it would
+    /// fail and start a cooldown) can be displaced by an outsider bonding twice its bond: the sham
+    /// ends at once with full refunds and no cooldown, and the outsider's challenge runs instead.
+    function test_displacementBreaksTheShamChallengeLock() public {
+        vm.deal(KING_WALLET, 1 ether);
+        vm.warp(block.timestamp + 7 days);
+        vm.prank(KING_WALLET);
+        uint256 sham = registry.openChallenge{value: 0.01 ether}(CRWN, address(0x1000));
+        vm.prank(KING_WALLET);
+        registry.stake{value: 0.01 ether}(sham, CrownRegistry.Side.King);
+        vm.warp(block.timestamp + 1 days);
+
+        vm.prank(alice);
+        vm.expectEmit(true, true, true, true);
+        emit CrownRegistry.ChallengeDisplaced(sham, sham + 1, CRWN, 0.02 ether);
+        uint256 id = registry.openChallenge{value: 0.02 ether}(CRWN, CHAL_TOKEN);
+        assertEq(id, sham + 1);
+        assertEq(registry.liveChallenge(CRWN), id);
+        assertTrue(registry.hasLiveChallenge(CRWN));
+        assertEq(registry.requiredBond(CRWN), 0.04 ether, "the next displacement doubles again");
+
+        CrownRegistry.Challenge memory old = registry.challenges(sham);
+        assertTrue(old.finalized);
+        assertFalse(old.challengerWon);
+        assertEq(old.displacedBy, id);
+        assertEq(old.winnerBonus, 0);
+        assertEq(registry.cooldownUntil(CRWN), 0, "no cooldown from a displaced challenge");
+        assertEq(registry.king(CRWN).token, KING_TOKEN, "no crown change from a displaced challenge");
+        assertEq(registry.treasuryOwed(), 0, "nothing slashed");
+        // The displaced challenge is over: no more stakes, no finalize, full refunds on both sides.
+        vm.prank(KING_WALLET);
+        vm.expectRevert(abi.encodeWithSelector(CrownRegistry.AlreadyFinalized.selector, sham));
+        registry.stake{value: 1}(sham, CrownRegistry.Side.King);
+        vm.expectRevert(abi.encodeWithSelector(CrownRegistry.AlreadyFinalized.selector, sham));
+        registry.finalize(sham);
+        assertEq(registry.claimable(sham, KING_WALLET), 0.02 ether);
+        uint256 before = KING_WALLET.balance;
+        vm.prank(KING_WALLET);
+        registry.claim(sham);
+        assertEq(KING_WALLET.balance - before, 0.02 ether);
+
+        CrownRegistry.Challenge memory c = registry.challenges(id);
+        assertEq(c.bond, 0.02 ether);
+        assertEq(c.challengerStake, 0.02 ether);
+        assertEq(c.challengerBeneficiary, alice);
+        assertEq(c.windowEnd, block.timestamp + 72 hours, "the new challenge has its own window");
+        (uint256 opened,,, uint256 chalEver) = registry.tickerTotals(CRWN);
+        assertEq(opened, 2);
+        assertEq(chalEver, 0.03 ether);
+        // Alice's challenge resolves by the ordinary rules: her 0.02 beats the empty king side with quorum.
+        vm.prank(bob);
+        registry.stake{value: 0.03 ether}(id, CrownRegistry.Side.Challenger);
+        vm.warp(c.finalizeAfter);
+        registry.finalize(id);
+        assertEq(registry.king(CRWN).beneficiary, alice);
+        assertEq(address(registry).balance, 0.05 ether, "escrow: alice's and bob's fully refundable winning stakes");
     }
 
     // ------------------------------------------------------------ stake

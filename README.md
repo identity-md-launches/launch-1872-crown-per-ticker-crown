@@ -40,9 +40,20 @@ All parameters are constants (the brief fixes them; nothing can change them afte
 
 - `registerKing(ticker, token, beneficiary)`: the first registration for a ticker crowns that token.
   Permissionless and first-come, which is why the launch crowns CRWN in the constructor (below).
-- `openChallenge(ticker, challengerToken)` payable, exactly `BOND`: one live challenge per ticker; only
-  after `MIN_REIGN`; not during a cooldown; not with the king's own token. The caller becomes the
-  challenger token's beneficiary if the challenge succeeds. The bond is the challenger's first stake.
+- `openChallenge(ticker, challengerToken)` payable, exactly `requiredBond(ticker)`: `BOND` when no
+  challenge is live, or exactly twice the live challenge's bond to *displace* it while it is still in
+  its staking window (nothing can be opened while a live challenge is past its window and being
+  decided: `ChallengeLive`). Only after `MIN_REIGN`; not during a cooldown; not with the king's own
+  token. The caller becomes the challenger token's beneficiary if the challenge succeeds. The bond is
+  the challenger's first stake.
+- Displacement (`ChallengeDisplaced`): the displaced challenge is finalized at once with
+  `displacedBy` set, nothing slashed, no cooldown and no crown change; every stake on both sides is
+  refundable in full through `claim`. The new challenge starts its own 72-hour window with the
+  doubled bond as its challenger stake. This is the rule decision behind the "one live challenge per
+  ticker" slot: a king (or an ally) who opens a sham challenge against itself to keep outsiders out
+  can be displaced for 0.02 ETH, and each further round doubles the bond at stake, so the slot can be
+  held only by out-bonding every rival, never for free. The 7-day minimum reign after a genuine flip
+  and the 3-day cooldown after a genuinely failed challenge are unchanged.
 - `stake(challengeId, side)` payable, any amount, while `block.timestamp < windowEnd`.
 - `finalize(challengeId)`, anyone, once `block.timestamp >= windowEnd + TIMELOCK`. The challenger wins
   iff `challengerStake > kingStake` and `kingStake + challengerStake >= QUORUM`. On a flip the registry
@@ -56,10 +67,11 @@ All parameters are constants (the brief fixes them; nothing can change them afte
 - Rounding: pro-rata shares and the 80% refund are floored per staker, so the contract never owes
   more than it holds; the dust (under one wei per stake share) stays in the contract. The fuzz test
   `testFuzz_conservation` checks this.
-- Events: `Crowned`, `ChallengeOpened`, `Staked`, `Dethroned`, `ChallengeFailed`, `Claimed`,
-  `TreasuryWithdrawn`. Public per-ticker totals: `tickerTotals(ticker)` (challenges opened,
-  dethronements, ETH ever staked per side), `liveChallenge(ticker)`, `cooldownUntil(ticker)`,
-  `challenges(id)` with both running stakes, `claimable(id, staker)`, `tickerOf(symbol)`.
+- Events: `Crowned`, `ChallengeOpened`, `ChallengeDisplaced`, `Staked`, `Dethroned`,
+  `ChallengeFailed`, `Claimed`, `TreasuryWithdrawn`. Public per-ticker totals: `tickerTotals(ticker)`
+  (challenges opened, dethronements, ETH ever staked per side), `liveChallenge(ticker)`,
+  `cooldownUntil(ticker)`, `requiredBond(ticker)`, `challenges(id)` with both running stakes, its
+  `bond` and `displacedBy`, `claimable(id, staker)`, `tickerOf(symbol)`.
 
 Constructor: `(string genesisSymbol, address genesisToken, address genesisBeneficiary)`. It crowns
 `tickerOf(genesisSymbol)` at deployment, so no one can front-run the genesis registration. Passing
@@ -97,46 +109,72 @@ What happens on a swap of a registered native-ETH pool:
 3. Read `registry.king(ticker).beneficiary` with a raw staticcall and decode the beneficiary word by
    hand: an answer that is not exactly 96 bytes, or whose beneficiary word has bits set above the
    address, is malformed and skips the cut (`abi.decode` would revert the swap on it).
-4. If the PoolManager's ETH balance covers it, `poolManager.take(ETH, beneficiary, cut)` pays the
-   beneficiary at once, with at most `PAYOUT_GAS` (150,000) gas, and the callback returns `+cut` as
-   the hook delta, so the hook's own delta nets to zero before the callback returns. The swapper pays
+4. The payment runs in its own call frame, `payout(beneficiary, cut)` (an external self-call only
+   the hook may make): it snapshots the PoolManager's nonzero-delta count, the hook's own ETH delta,
+   the manager's ETH balance and its synced-currency and reserves slots, performs
+   `poolManager.take(ETH, beneficiary, cut)` with at most `PAYOUT_GAS` (150,000) gas, and then
+   reverts (`PayoutLeftTraces`) unless the only change is the hook's own `-cut` delta: the count grew
+   by exactly one, the hook's delta is exactly `-cut`, the balance fell by exactly `cut`, and no
+   currency was synced or settled. `_payCut` catches that revert, which rolls back the transfer
+   *and everything the beneficiary did while being paid*, and the swap runs without the cut
+   (`BENEFICIARY_REJECTED`). So a beneficiary contract that accepts the ETH and, inside `receive()`,
+   re-enters the unlocked PoolManager to leave a delta open (its own `mint`/`take`, a `settleFor` of
+   somebody else's debt, a `sync`) cannot make the swapper's unlock end in `CurrencyNotSettled`; its
+   re-entry is undone and it simply forfeits that cut. On success the callback returns `+cut` as the
+   hook delta, so the hook's own delta nets to zero before the callback returns. The swapper pays
    the cut on top of the pool's input (buys) or receives the pool's output minus the cut (sells).
-5. `crownPaid[ticker][currency]` grows by exactly what was transferred; `CrownPaid` is emitted.
+   If the PoolManager holds less ETH than the cut, what it holds is paid (`min(cut, balance)`); if it
+   holds none, the cut is skipped.
+5. `crownPaid[ticker][currency]` grows by exactly what was transferred; `CrownPaid` is emitted with
+   that amount.
 
 The hook never holds funds and never reverts a swap. Every failure path skips the cut and emits
 `CutSkipped(poolId, ticker, cut, reason)`:
 
 | Reason | When |
 | --- | --- |
-| `NO_REGISTRY` | the owner has not set the registry yet |
+| `POOL_NOT_REGISTERED` | the pool is initialized but the owner has not bound its ticker yet (`ticker` is zero in the event; the amount is the default cut it would have charged) |
 | `REGISTRY_READ_FAILED` | the registry read reverts, or returns data that is not 96 bytes or whose beneficiary word is not a clean address |
 | `NO_KING` | the pool's ticker has no king (beneficiary is zero) |
-| `MANAGER_SHORT_OF_ETH` | the PoolManager holds less ETH than the cut (see below) |
-| `BENEFICIARY_REJECTED` | the beneficiary refuses ETH or burns more than `PAYOUT_GAS` |
+| `MANAGER_SHORT_OF_ETH` | the PoolManager holds no ETH at all (see below); a partial balance is paid, not skipped |
+| `BENEFICIARY_REJECTED` | the beneficiary refuses ETH, burns more than `PAYOUT_GAS`, or re-entered the PoolManager during its payment (the whole payment is rolled back) |
 
 Pay-at-source versus a fresh PoolManager: `take` pays from what the PoolManager already holds, and the
 swapper settles only after the hook runs. The launch pool is seeded with tokens only, so the first
-ETH-paying buy on a PoolManager that holds no ETH is executed without the cut, and the ETH it
-settles funds the cut of every later swap (`test_freshManagerSeededWithTokensOnly`). The brief
-forbids storing or pooling fees for claiming, so this is handled by skipping rather than by minting
-an ERC-6909 claim. A beneficiary contract that rejects ETH does not halt trading: its cuts are
-skipped until the crown changes hands.
+ETH-paying buy on a PoolManager that holds no ETH is executed without the cut; after it the manager
+holds that buy's ETH, and every later cut is paid in full when the manager's ETH covers it and
+otherwise up to what it holds (`test_freshManagerSeededWithTokensOnly`,
+`test_partialCutWhenManagerHoldsLessThanTheCut`). The brief forbids storing or pooling fees for
+claiming, so a shortfall is paid partially or skipped rather than minted as an ERC-6909 claim. A
+beneficiary contract that rejects ETH, or misbehaves while being paid, does not halt trading: its
+cuts are skipped until the crown changes hands.
 
 Owner functions (owner = `$owner`, the launch payer; never the factory or `tx.origin`):
 
-- `setRegistry(registry)`: once; must be a contract; immutable afterwards.
-- `registerPool(key, ticker, cutBps)`: once per pool; the pool must be initialized through this hook
-  and have native ETH as `currency0`; `cutBps` ≤ `MAX_CUT_BPS` (500); `DEFAULT_CUT_BPS` is 100.
-  Immutable afterwards, so the owner cannot change a pool's cut or ticker later.
+- `setRegistry(registry)`: once; immutable afterwards. The address's runtime code hash must equal
+  `CROWN_REGISTRY_CODEHASH` or `THRONE_REGISTRY_CODEHASH`, immutables the constructor computes from
+  `type(CrownRegistry).runtimeCode` / `type(ThroneRegistry).runtimeCode` (the registry has no
+  immutables and the build strips metadata, so a registry compiled with these settings matches byte
+  for byte). The owner therefore picks *which genuine registry instance* the pool follows, and with it
+  the genesis crown; it cannot bind a contract of its own making whose `king` names whoever it likes,
+  and after the binding nothing but the registry's rules decides who is paid.
+- `registerPool(key, ticker, cutBps)`: once per pool; the registry must be set; the pool must be
+  initialized through this hook and have native ETH as `currency0`; `cutBps` ≤ `MAX_CUT_BPS` (500);
+  and `registry.king(ticker).token` must be the pool's `currency1` (`KingIsNotPoolToken`), so a pool
+  can only be bound to the ticker its own token is king of; a ticker somebody squatted first cannot
+  capture another pool's cut. `afterInitialize` records every pool with `DEFAULT_CUT_BPS` (100);
+  `registerPool` binds the ticker and may set another cut. Immutable afterwards, so the owner cannot
+  change a pool's cut or ticker later.
 
 There are no other admin functions, no pause, no upgrade. The owner may `renounceOwnership()` after
 setup. Liquidity callbacks are not enabled, so the factory's zero-liquidity fee collect passes
 through untouched.
 
 External calls the hook makes, all inside the PoolManager's unlock: the registry read (staticcall),
-`poolManager.take` for the beneficiary payment, and the rehearsal self-call `simulateSwap`, which
-only the hook may invoke (`NotSelf` otherwise) and which calls `poolManager.swap` and reverts. The
-hook holds no funds and has no storage the rehearsal could touch.
+the payment self-call `payout` (which performs `poolManager.take` and reads the manager's transient
+accounting through `exttload`), and the rehearsal self-call `simulateSwap`, which calls
+`poolManager.swap` and reverts. Both self-calls refuse every caller but the hook (`NotSelf`). The
+hook holds no funds and has no storage either self-call could touch.
 
 Wizard-style configuration record for the hook:
 
@@ -175,8 +213,13 @@ beyond its name and symbol; the swap fee is in the hook.
 
 1. `CrownHook.setRegistry(<CrownRegistry address>)` — the registry the launch deployed.
 2. `CrownHook.registerPool(poolKey, keccak256("CRWN"), 100)` — the launch pool's key (ETH, token,
-   12500, 60, hook) and the cut in bps (100 = 1%, maximum 500). Until both are done, swaps run without
-   the cut. `script/DeployCrown.s.sol:configureHook` does both when sent by the owner.
+   12500, 60, hook) and the cut in bps (100 = 1%, maximum 500); it requires step 1 and a registry
+   whose CRWN king is the launch token. Until both are done, swaps run without the cut and emit
+   `CutSkipped(..., "POOL_NOT_REGISTERED")`. `script/DeployCrown.s.sol:configureHook` does both when
+   sent by the owner. The registry the factory does not deploy is the reason this gap exists; the
+   hook's constructor and `setRegistry`/`registerPool` signatures are fixed by the accepted floor and
+   proof harnesses, so the binding stays a one-time owner step restricted to a bytecode-identical
+   `CrownRegistry`.
 3. Deploy the standing challenger: `CrownChallengerToken(<recipient>)`, for example with
    `CROWN_CHALLENGER_RECIPIENT=<addr> forge script script/DeployCrown.s.sol --broadcast`.
 4. Optionally `renounceOwnership()` on the hook once configured.
@@ -184,7 +227,8 @@ beyond its name and symbol; the swap fee is in the hook.
 Operational notes: `CrownRegistry` has no owner and no parameters to maintain. `finalize` and
 `withdrawTreasury` are permissionless and must be called by someone (a keeper, the site, anyone);
 nothing pays out automatically. Stakers pull with `claim`. The king's beneficiary must be able to
-receive plain ETH transfers within 150,000 gas, or its cuts are skipped.
+receive plain ETH transfers within 150,000 gas without touching the PoolManager, or its cuts are
+skipped.
 
 ## Demo flow (what the integration test does)
 
@@ -238,7 +282,7 @@ Without a vetted network file, the page has **no active swap, quote, approval or
 ### Available flows
 
 - Current king token and beneficiary, reign start/age, ticker totals and cumulative `crownPaid[ticker][native ETH]`. Unknown values are never rendered as zero.
-- `openChallenge` with its exact 0.01 ETH bond, same-symbol candidate validation and explicit beneficiary/slashing explanation. The standing challenger is prefilled only when that contract exists in the handoff; otherwise the visitor enters a real token address.
+- `openChallenge` with the registry's `requiredBond` (0.01 ETH, or twice the live challenge's bond to displace it during its staking window, offered under the live challenge as "Displace this challenge"), same-symbol candidate validation and explicit beneficiary/slashing explanation. The standing challenger is prefilled only when that contract exists in the handoff; otherwise the visitor enters a real token address.
 - `stake` on either side, exact decimal-to-wei conversion, both running stakes, quorum progress, chain-time countdown, 72-hour window and 24-hour timelock. The seven-day reign and three-day failed-challenge cooldown gate opening another challenge.
 - Permissionless `finalize`, per-wallet `claim` by historical challenge ID, and `withdrawTreasury` to the address read from the registry. Claims are scoped to CRWN, including challenges older than the current live one.
 - `registerKing` only if the CRWN ticker is unregistered; the connected wallet is explicitly shown as the beneficiary in this flow.
@@ -275,7 +319,8 @@ solc version). Dependencies are vendored as plain files in `lib/` (versions in `
 Uniswap v4-core, forge-std, OpenZeppelin Contracts v5.1.0, solmate's `Owned.sol` (needed by
 v4-core's `ProtocolFees`).
 
-Tests (78 in the recorded seeded worker run): `test/CrownRegistry.t.sol` (bond, reign, window, timelock, quorum boundary and tie,
+Tests (82 in the recorded seeded worker run; the hostile-beneficiary, displacement, partial-cut and
+registration-guard cases were added in the findings revision): `test/CrownRegistry.t.sol` (bond, reign, window, timelock, quorum boundary and tie,
 exact-wei slash split for a flip, a failed challenge and a no-quorum challenge, empty winning side,
 pull claims, rejecting receiver, fuzzed conservation of funds), `test/CrownHook.t.sol` (permissions
 and address bits, caller checks, owner setters, all four swap shapes on a funded manager, fuzzed
@@ -293,10 +338,17 @@ beneficiary, the end-to-end dethrone, a zero-liquidity collect), `test/CrownToke
 - The bond counts as challenger stake (toward quorum and the vote) and is refunded or slashed like
   any other stake.
 - Rounding dust from pro-rata shares stays in the registry; it is bounded by one wei per stake share.
+  A sweep would need to know when the last staker of a round has claimed, which the pull pattern
+  cannot tell without per-round staker bookkeeping, and crediting the remainder at `finalize` is not
+  possible either (per-staker floors are only known at claim time). It is documented, bounded and
+  checked by the invariant suite rather than hidden.
+- Displacing a live challenge costs exactly twice its bond, a chosen rule (see the registry rules);
+  the bond ladder is 0.01, 0.02, 0.04 … ETH.
 - The cut currency is always native ETH; `registerPool` refuses pools whose `currency0` is not ETH.
   `crownPaid` is keyed by currency anyway, as the brief asks.
 - `PAYOUT_GAS` (150,000) is a chosen constant: it caps what a hostile beneficiary can burn inside
-  someone else's swap.
+  someone else's swap. What it can *do* in that gas is bounded by `payout`'s accounting checks: any
+  trace it leaves in the PoolManager rolls its payment back.
 - Tests pass with an empty environment and in any order; none reads env vars.
 - Tests are not an audit: an independent adversarial review is still needed before funds are at
   stake.

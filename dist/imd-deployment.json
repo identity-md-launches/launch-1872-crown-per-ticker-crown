@@ -13,11 +13,11 @@
     },
     {
       "path": "abi/CrownHook.json",
-      "sha256": "3f4fcbf31f8f8585e9ba4f9ddd1b4b940ac84630b1e9ecbd54bda876ccde6382"
+      "sha256": "bedcafba90076f39e10d451114f8c92961b5c325edd9a35b746c50a4bd9c2ac4"
     },
     {
       "path": "abi/CrownRegistry.json",
-      "sha256": "4c7dd02ab7e85a26ddefe449c519565e9375b19c71c59e3adcc742a72393a26d"
+      "sha256": "7e080098530958dd50cb1ebe4af40776c48e36316f7a8d55cfb770f263c9e7fa"
     },
     {
       "path": "abi/CrownToken.json",
@@ -25,31 +25,31 @@
     },
     {
       "path": "abi/ThroneRegistry.json",
-      "sha256": "4c7dd02ab7e85a26ddefe449c519565e9375b19c71c59e3adcc742a72393a26d"
+      "sha256": "7e080098530958dd50cb1ebe4af40776c48e36316f7a8d55cfb770f263c9e7fa"
     },
     {
-      "path": "assets/ccip-Cp0_HofE.js",
-      "sha256": "791ca977a4e33c2c8e0ccc8542cb5e92cae520af296fb896a677c35139fedf7c"
+      "path": "assets/ccip-DTxdOWV4.js",
+      "sha256": "3ea26198768914a1ad70681b1cc536c30343fcbd11c695d41f151933590cba14"
     },
     {
       "path": "assets/hooks.module-DE9oX6xH.js",
       "sha256": "18290b66f5736ddfcd375526f88fd55c2ecf072d6feee11d3554a78df4a3594f"
     },
     {
-      "path": "assets/index-C2Wbb7G-.css",
-      "sha256": "47a6a070693051fa5bc190ca5013db788ef4edb3b1fdc2d25a0aef3894f31b8d"
+      "path": "assets/index-Cx0qEvMU.js",
+      "sha256": "48f137f53add90b3f9544a16514f31c3584a41a45c69463f38dff3135130b2f1"
     },
     {
-      "path": "assets/index-NlUkNkPb.js",
-      "sha256": "744804dcb0e9db30922766cda121c37322fe013b27375b35ace89716020bb8fc"
+      "path": "assets/index-D1UV8ghm.css",
+      "sha256": "be2cb88f9cb34fdbe38d96bff8ec7286954820739226d65851c11526e010ea8f"
     },
     {
-      "path": "assets/index-i5OnzwSe.js",
-      "sha256": "d79ca3ccd293f236e7cf4c583741318572cf3e0dbc7985a986e69d6e8bde7bb0"
+      "path": "assets/index-DU0WTre0.js",
+      "sha256": "8c4b112e4846f22c890bdd6754755b48320b3db00a39ceea9d65bf029526cd73"
     },
     {
-      "path": "assets/index-iLYAXTGY.js",
-      "sha256": "2502ce9c13f95265190f6bb995209544ee1cbcc27f03a27d4a522d2e35a87adb"
+      "path": "assets/index-Dlomt_yQ.js",
+      "sha256": "fcaf32a23db03366a9dbd79c40114b23fada0cb96a1a516826a3a91e8520fc29"
     },
     {
       "path": "favicon.svg",
@@ -57,7 +57,7 @@
     },
     {
       "path": "index.html",
-      "sha256": "3033e350f4ac7222c0a0e3720f5ef9cc818383cbf97fbab7e413f049612e0c8e"
+      "sha256": "8ab2cf32a8bfc7a7ab904233d1f0a46a857d7f4ab40cbfd851e1f1c816e25c5b"
     },
     {
       "path": "share.png",

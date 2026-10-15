@@ -11,7 +11,11 @@ import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta} from "v4-core/src/types/BeforeSwapDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
+import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary.sol";
+import {CurrencyReserves} from "v4-core/src/libraries/CurrencyReserves.sol";
 import {ICrownRegistry} from "./interfaces/ICrownRegistry.sol";
+import {CrownRegistry} from "./CrownRegistry.sol";
+import {ThroneRegistry} from "./ThroneRegistry.sol";
 
 /// @title CrownHook
 /// @notice A Uniswap v4 fee hook that skims a per-pool cut of every swap's native-ETH side and pays
@@ -22,8 +26,12 @@ import {ICrownRegistry} from "./interfaces/ICrownRegistry.sol";
 /// Nothing is pooled for claiming.
 ///
 /// Never blocks a swap: when the registry is unset, the ticker unregistered, the registry read
-/// reverts, the king has no beneficiary, the PoolManager does not hold enough ETH to pay, or the
-/// beneficiary rejects the payment, the swap proceeds without the cut.
+/// reverts, the king has no beneficiary, the PoolManager holds no ETH to pay from, or the
+/// beneficiary rejects the payment, the swap proceeds without the cut. The payment runs in its own
+/// call frame (`payout`) that checks the PoolManager's accounting afterwards: a beneficiary that
+/// accepts the ETH but leaves anything else behind in the unlocked PoolManager (an open delta of
+/// its own, a settlement of somebody else's, a sync) is rolled back together with its payment, so
+/// no beneficiary can hold the pool hostage.
 ///
 /// The cut is always ETH, which is `currency0` of every native pool. When ETH is the swap's
 /// specified amount (exact-input buy, exact-output sell) it is taken in `beforeSwap` through the
@@ -37,6 +45,7 @@ import {ICrownRegistry} from "./interfaces/ICrownRegistry.sol";
 /// pool without liquidity, pays the cut on what was filled, which for no fill is nothing.
 contract CrownHook is IHooks, Ownable {
     using PoolIdLibrary for PoolKey;
+    using TransientStateLibrary for IPoolManager;
 
     // ---------------------------------------------------------------- parameters
 
@@ -62,6 +71,11 @@ contract CrownHook is IHooks, Ownable {
     // ---------------------------------------------------------------- state
 
     IPoolManager public immutable poolManager;
+    /// @notice Runtime code hashes of the two registries this hook accepts: `CrownRegistry` and its
+    /// alias `ThroneRegistry`, as compiled with this hook. The owner can bind one of these and
+    /// nothing else, so the king a pool pays is always resolved by the registry's own rules.
+    bytes32 public immutable CROWN_REGISTRY_CODEHASH;
+    bytes32 public immutable THRONE_REGISTRY_CODEHASH;
     /// @notice The registry, set once by the owner after launch; the zero address until then.
     ICrownRegistry public registry;
     mapping(PoolId => PoolConfig) public pools;
@@ -89,6 +103,10 @@ contract CrownHook is IHooks, Ownable {
     error ZeroTicker();
     error ZeroAddress();
     error CutTooHigh(uint16 cutBps, uint16 maxCutBps);
+    error NotCrownRegistry(address candidate);
+    error RegistryNotSet();
+    error KingIsNotPoolToken(bytes32 ticker, address king, address poolToken);
+    error PayoutLeftTraces();
 
     // ---------------------------------------------------------------- constructor
 
@@ -96,6 +114,8 @@ contract CrownHook is IHooks, Ownable {
     /// @param owner_ The hook owner (written "$owner"): registers pools and sets the registry once.
     constructor(IPoolManager poolManager_, address owner_) Ownable(owner_) {
         poolManager = poolManager_;
+        CROWN_REGISTRY_CODEHASH = keccak256(type(CrownRegistry).runtimeCode);
+        THRONE_REGISTRY_CODEHASH = keccak256(type(ThroneRegistry).runtimeCode);
         Hooks.validateHookPermissions(this, getHookPermissions());
     }
 
@@ -127,16 +147,24 @@ contract CrownHook is IHooks, Ownable {
 
     // ---------------------------------------------------------------- owner
 
-    /// @notice Point the hook at the registry. Once, after launch; immutable afterwards.
+    /// @notice Point the hook at the registry. Once, after launch; immutable afterwards. Only a
+    /// contract whose runtime code is exactly `CrownRegistry`'s (or `ThroneRegistry`'s) is accepted:
+    /// the owner chooses which genuine registry instance governs, never what the rules are.
     function setRegistry(ICrownRegistry registry_) external onlyOwner {
         if (address(registry) != address(0)) revert RegistryAlreadySet();
-        if (address(registry_) == address(0) || address(registry_).code.length == 0) revert ZeroAddress();
+        if (address(registry_) == address(0)) revert ZeroAddress();
+        bytes32 codehash = address(registry_).codehash;
+        if (codehash != CROWN_REGISTRY_CODEHASH && codehash != THRONE_REGISTRY_CODEHASH) {
+            revert NotCrownRegistry(address(registry_));
+        }
         registry = registry_;
         emit RegistrySet(address(registry_));
     }
 
     /// @notice Bind an initialized native-ETH pool of this hook to `ticker` with a cut of `cutBps`.
-    /// Once per pool; the binding and the cut are immutable afterwards.
+    /// Once per pool; the binding and the cut are immutable afterwards. The registry must already
+    /// be set and the ticker's current king must be the pool's own token, so a pool can never be
+    /// bound to a ticker somebody else crowned.
     function registerPool(PoolKey calldata key, bytes32 ticker, uint16 cutBps) external onlyOwner {
         if (address(key.hooks) != address(this)) revert NotThisHook();
         if (!key.currency0.isAddressZero()) revert NotNativePool();
@@ -146,6 +174,11 @@ contract CrownHook is IHooks, Ownable {
         PoolConfig storage p = pools[id];
         if (!p.initialized) revert PoolNotInitialized();
         if (p.ticker != bytes32(0)) revert PoolAlreadyRegistered();
+        ICrownRegistry reg = registry;
+        if (address(reg) == address(0)) revert RegistryNotSet();
+        address kingToken = reg.king(ticker).token;
+        address poolToken = Currency.unwrap(key.currency1);
+        if (kingToken != poolToken) revert KingIsNotPoolToken(ticker, kingToken, poolToken);
         p.ticker = ticker;
         p.cutBps = cutBps;
         emit PoolRegistered(id, ticker, cutBps);
@@ -153,9 +186,12 @@ contract CrownHook is IHooks, Ownable {
 
     // ---------------------------------------------------------------- callbacks
 
+    /// @dev Records the pool with the default cut; the owner binds its ticker with `registerPool`
+    /// (and may set another cut then). Accepts any sender: the launch factory initializes the pool.
     function afterInitialize(address, PoolKey calldata key, uint160, int24) external onlyPoolManager returns (bytes4) {
         PoolId id = key.toId();
         pools[id].initialized = true;
+        pools[id].cutBps = DEFAULT_CUT_BPS;
         emit PoolInitialized(id, key.currency0, key.currency1);
         return IHooks.afterInitialize.selector;
     }
@@ -299,20 +335,22 @@ contract CrownHook is IHooks, Ownable {
     }
 
     /// @dev Pays the cut on `amount` ETH to the king's beneficiary; returns what was actually paid.
-    /// Never reverts: every failure path returns 0 and the swap runs without the cut.
+    /// Never reverts: every failure path returns 0 and the swap runs without the cut. When the
+    /// PoolManager holds less ETH than the cut, what it holds is paid.
     function _payCut(PoolKey calldata key, uint256 amount) internal returns (uint256) {
         PoolId id = key.toId();
         PoolConfig storage p = pools[id];
         bytes32 ticker = p.ticker;
-        if (ticker == bytes32(0) || !key.currency0.isAddressZero() || amount > MAX_AMOUNT) return 0;
+        if (!key.currency0.isAddressZero() || amount > MAX_AMOUNT) return 0;
         uint256 cut = (amount * p.cutBps) / BPS;
         if (cut == 0) return 0;
-
-        ICrownRegistry reg = registry;
-        if (address(reg) == address(0)) {
-            emit CutSkipped(id, ticker, cut, "NO_REGISTRY");
+        if (ticker == bytes32(0)) {
+            if (p.initialized) emit CutSkipped(id, ticker, cut, "POOL_NOT_REGISTERED");
             return 0;
         }
+
+        // A registered pool implies a bound registry (`registerPool` requires one, and it is immutable).
+        ICrownRegistry reg = registry;
         // A raw staticcall: a revert, an empty answer or a malformed one all skip the cut instead
         // of reverting the swap (a high-level try/catch would still revert on bad return data).
         (bool ok, bytes memory data) = address(reg).staticcall(abi.encodeCall(ICrownRegistry.king, (ticker)));
@@ -337,11 +375,14 @@ contract CrownHook is IHooks, Ownable {
             return 0;
         }
         // `take` pays from what the PoolManager already holds; the swapper settles only afterwards.
-        if (address(poolManager).balance < cut) {
+        // Pay what it holds when that is less than the cut, and nothing when it holds nothing.
+        uint256 available = address(poolManager).balance;
+        if (available == 0) {
             emit CutSkipped(id, ticker, cut, "MANAGER_SHORT_OF_ETH");
             return 0;
         }
-        try poolManager.take{gas: PAYOUT_GAS}(CurrencyLibrary.ADDRESS_ZERO, beneficiary, cut) {
+        if (available < cut) cut = available;
+        try this.payout(beneficiary, cut) {
             crownPaid[ticker][CurrencyLibrary.ADDRESS_ZERO] += cut;
             emit CrownPaid(id, ticker, beneficiary, cut);
             return cut;
@@ -349,5 +390,32 @@ contract CrownHook is IHooks, Ownable {
             emit CutSkipped(id, ticker, cut, "BENEFICIARY_REJECTED");
             return 0;
         }
+    }
+
+    /// @notice Pays `cut` ETH from the PoolManager to `beneficiary` and reverts unless the only trace
+    /// the payment left in the PoolManager is the hook's own `-cut` delta. Only the hook may call it,
+    /// from `_payCut`, which catches the revert: a beneficiary that re-enters the unlocked
+    /// PoolManager during its payment (opens a delta, settles somebody's, syncs a currency) is
+    /// rolled back together with its payment, and the swap proceeds without the cut.
+    function payout(address beneficiary, uint256 cut) external {
+        if (msg.sender != address(this)) revert NotSelf();
+        IPoolManager pm = poolManager;
+        uint256 deltasBefore = pm.getNonzeroDeltaCount();
+        int256 hookDeltaBefore = pm.currencyDelta(address(this), CurrencyLibrary.ADDRESS_ZERO);
+        uint256 balanceBefore = address(pm).balance;
+        bytes32 syncedCurrencyBefore = pm.exttload(CurrencyReserves.CURRENCY_SLOT);
+        bytes32 syncedReservesBefore = pm.exttload(CurrencyReserves.RESERVES_OF_SLOT);
+
+        pm.take{gas: PAYOUT_GAS}(CurrencyLibrary.ADDRESS_ZERO, beneficiary, cut);
+
+        // The hook's delta went from zero to -cut and nothing else moved: no other delta was opened
+        // or closed, no ETH entered or left beyond the cut, no currency was synced or settled.
+        if (
+            pm.getNonzeroDeltaCount() != deltasBefore + 1 || hookDeltaBefore != 0
+                || pm.currencyDelta(address(this), CurrencyLibrary.ADDRESS_ZERO) != -int256(cut)
+                || address(pm).balance != balanceBefore - cut
+                || pm.exttload(CurrencyReserves.CURRENCY_SLOT) != syncedCurrencyBefore
+                || pm.exttload(CurrencyReserves.RESERVES_OF_SLOT) != syncedReservesBefore
+        ) revert PayoutLeftTraces();
     }
 }

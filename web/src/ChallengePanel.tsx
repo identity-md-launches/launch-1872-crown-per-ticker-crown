@@ -90,6 +90,112 @@ export function ChallengePanel({
     if (decimals > 36) throw new Error("This token has unsupported decimals.");
     return token;
   }
+  const displacing = !!active && currentPhase === "staking";
+  const requiredBond = s?.requiredBond ?? 0n;
+  const openForm = (
+        <>
+          <p className="panel-intro">
+            {displacing
+              ? `Displace challenge #${s!.liveId.toString()} with a different CRWN token. It ends at once, every stake on both sides is refunded in full, and your challenge starts its own 72-hour window.`
+              : "Challenge with a different CRWN token. The opening bond backs your candidate."}
+          </p>
+          <label className="field">
+            {notCrowned ? "King token address" : "Challenger token address"}
+            <input
+              ref={candidateRef}
+              aria-invalid={!!candidateError}
+              aria-describedby={candidateError ? "candidate-error" : undefined}
+              name="candidate"
+              autoComplete="off"
+              spellCheck={false}
+              value={candidate}
+              onChange={(e) => {
+                setCandidate(e.target.value);
+                setCandidateError("");
+              }}
+              placeholder="Paste a CRWN contract address"
+            />
+          </label>
+          {candidateError && (
+            <p id="candidate-error" role="alert" className="error-text">
+              {candidateError}
+            </p>
+          )}
+          <div className="cost-line">
+            <span>
+              {notCrowned
+                ? "Registration"
+                : displacing
+                  ? "Displacement bond"
+                  : "Opening bond"}
+            </span>
+            <strong>
+              {notCrowned
+                ? "Gas only"
+                : `${eth(s?.requiredBond ?? 10000000000000000n)} ETH`}
+            </strong>
+          </div>
+          <Transaction
+            r={r}
+            connect={connect}
+            primary
+            onPrepareError={(error) => {
+              setCandidateError(friendly(error));
+              candidateRef.current?.focus();
+            }}
+            label={
+              notCrowned
+                ? "Register king"
+                : displacing
+                  ? "Displace challenge"
+                  : "Open challenge"
+            }
+            disabled={
+              !allowed || (!notCrowned && (!eligible || requiredBond === 0n))
+            }
+            summary={
+              <>
+                <p>
+                  {notCrowned
+                    ? "Crown this token as the first king of CRWN."
+                    : displacing
+                      ? `Bond ${eth(requiredBond)} ETH (twice the live challenge’s bond) to displace challenge #${s!.liveId.toString()} and open a new 72-hour challenge. The bond is your challenger stake.`
+                      : "Bond 0.01 ETH to open a 72-hour challenge. The bond is your challenger stake."}
+                </p>
+                <p className="break-all">Token: {candidate}</p>
+                <p>
+                  Your connected wallet becomes the beneficiary{" "}
+                  {notCrowned ? "immediately" : "if the challenger wins"}.{" "}
+                  {notCrowned
+                    ? "Registration cannot be undone."
+                    : "You recover 80% of your bond if it loses."}
+                </p>
+              </>
+            }
+            prepare={async () => {
+              const token = await checkCandidate();
+              return notCrowned
+                ? request("registerKing", [TICKER, token, address])
+                : request("openChallenge", [TICKER, token], s!.requiredBond);
+            }}
+          />
+          {ready && !notCrowned && !eligible && (
+            <p className="small muted">
+              {now < s!.cooldown ? "Cooldown ends" : "Minimum reign ends"} in{" "}
+              {duration(boundary - now)}. {date(boundary)}.
+            </p>
+          )}
+          <p className="small muted">
+            {!ready
+              ? "Bond counts toward the challenger’s stake."
+              : notCrowned
+                ? "The first registration is permanent until a successful challenge."
+                : displacing
+                  ? "Each displacement doubles the bond, so a sham challenge cannot hold the slot for free."
+                  : "The caller receives future crown fees if the challenger wins."}
+          </p>
+        </>
+  );
   return (
     <section
       className={`challenge-panel ${active ? "is-live" : ""}`}
@@ -294,91 +400,17 @@ export function ChallengePanel({
               ETH challenger
             </p>
           )}
+          {displacing && (
+            <details className="displace-details">
+              <summary>
+                Displace this challenge ({eth(requiredBond)} ETH bond)
+              </summary>
+              {openForm}
+            </details>
+          )}
         </>
       ) : (
-        <>
-          <p className="panel-intro">
-            Challenge with a different CRWN token. The opening bond backs your
-            candidate.
-          </p>
-          <label className="field">
-            {notCrowned ? "King token address" : "Challenger token address"}
-            <input
-              ref={candidateRef}
-              aria-invalid={!!candidateError}
-              aria-describedby={candidateError ? "candidate-error" : undefined}
-              name="candidate"
-              autoComplete="off"
-              spellCheck={false}
-              value={candidate}
-              onChange={(e) => {
-                setCandidate(e.target.value);
-                setCandidateError("");
-              }}
-              placeholder="Paste a CRWN contract address"
-            />
-          </label>
-          {candidateError && (
-            <p id="candidate-error" role="alert" className="error-text">
-              {candidateError}
-            </p>
-          )}
-          <div className="cost-line">
-            <span>{notCrowned ? "Registration" : "Opening bond"}</span>
-            <strong>
-              {notCrowned
-                ? "Gas only"
-                : `${eth(s?.bond ?? 10000000000000000n)} ETH`}
-            </strong>
-          </div>
-          <Transaction
-            r={r}
-            connect={connect}
-            primary
-            onPrepareError={(error) => {
-              setCandidateError(friendly(error));
-              candidateRef.current?.focus();
-            }}
-            label={notCrowned ? "Register king" : "Open challenge"}
-            disabled={!allowed || (!notCrowned && !eligible)}
-            summary={
-              <>
-                <p>
-                  {notCrowned
-                    ? "Crown this token as the first king of CRWN."
-                    : "Bond 0.01 ETH to open a 72-hour challenge. The bond is your challenger stake."}
-                </p>
-                <p className="break-all">Token: {candidate}</p>
-                <p>
-                  Your connected wallet becomes the beneficiary{" "}
-                  {notCrowned ? "immediately" : "if the challenger wins"}.{" "}
-                  {notCrowned
-                    ? "Registration cannot be undone."
-                    : "You recover 80% of your bond if it loses."}
-                </p>
-              </>
-            }
-            prepare={async () => {
-              const token = await checkCandidate();
-              return notCrowned
-                ? request("registerKing", [TICKER, token, address])
-                : request("openChallenge", [TICKER, token], s!.bond);
-            }}
-          />
-          {ready && !notCrowned && !eligible && (
-            <p className="small muted">
-              {now < s!.cooldown ? "Cooldown ends" : "Minimum reign ends"} in{" "}
-              {duration(boundary - now)}. {date(boundary)}.
-            </p>
-          )}
-          <p className="small muted">
-            {!ready
-              ? "Bond counts toward the challenger’s stake."
-              : notCrowned
-                ? "The first registration is permanent until a successful challenge."
-                : "The caller receives future crown fees if the challenger wins."}
-          </p>
-        </>
+        openForm
       )}
       {blocked && <Notice>{blocked}</Notice>}
       <a className="how-link" href="#how-it-works">

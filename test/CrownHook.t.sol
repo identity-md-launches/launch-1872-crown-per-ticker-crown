@@ -18,6 +18,7 @@ import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {CrownHook} from "../src/CrownHook.sol";
 import {CrownRegistry} from "../src/CrownRegistry.sol";
+import {ThroneRegistry} from "../src/ThroneRegistry.sol";
 import {ICrownRegistry} from "../src/interfaces/ICrownRegistry.sol";
 import {CrownToken} from "../src/CrownToken.sol";
 import {CrownChallengerToken} from "../src/CrownChallengerToken.sol";
@@ -49,6 +50,41 @@ contract DirtyRegistry {
 
 /// @dev A beneficiary that refuses ETH.
 contract EthRejecter {}
+
+/// @dev A challenge winner whose receive() accepts the cut and leaves a 1-wei ERC-6909 debt open in
+/// the unlocked PoolManager, which would end the swapper's unlock in CurrencyNotSettled.
+contract HostileBeneficiary {
+    IPoolManager immutable manager;
+    uint8 public mode; // 0: mint a claim, 1: take 1 wei, 2: sync a currency
+
+    constructor(IPoolManager m) payable {
+        manager = m;
+    }
+
+    function setMode(uint8 m) external {
+        mode = m;
+    }
+
+    receive() external payable {
+        if (msg.sender != address(manager)) return;
+        if (mode == 0) manager.mint(address(this), 0, 1);
+        else if (mode == 1) manager.take(Currency.wrap(address(0)), address(this), 1);
+        else manager.sync(Currency.wrap(address(0xBEEF)));
+    }
+}
+
+/// @dev A registry that always names one wallet: what an owner could bind if the hook accepted any code.
+contract FakeRegistry {
+    address immutable wallet;
+
+    constructor(address wallet_) {
+        wallet = wallet_;
+    }
+
+    function king(bytes32) external view returns (ICrownRegistry.King memory) {
+        return ICrownRegistry.King(address(1), wallet, 0);
+    }
+}
 
 /// @dev Uses more than the hook's payout allowance; the caller must still finish its swap.
 contract GasBurningBeneficiary {
@@ -158,7 +194,7 @@ contract CrownHookTest is Test {
         (bool initialized, bytes32 ticker, uint16 bps) = hook.pools(k2.toId());
         assertTrue(initialized);
         assertEq(ticker, bytes32(0));
-        assertEq(bps, 0);
+        assertEq(bps, hook.DEFAULT_CUT_BPS(), "the default cut is recorded at initialization");
     }
 
     function test_setRegistryOnceAndOwnerOnly() public {
@@ -168,14 +204,30 @@ contract CrownHookTest is Test {
         vm.prank(owner);
         vm.expectRevert(CrownHook.ZeroAddress.selector);
         fresh.setRegistry(ICrownRegistry(address(0)));
+        address eoa = makeAddr("eoa");
         vm.prank(owner);
-        vm.expectRevert(CrownHook.ZeroAddress.selector);
-        fresh.setRegistry(ICrownRegistry(makeAddr("eoa")));
+        vm.expectRevert(abi.encodeWithSelector(CrownHook.NotCrownRegistry.selector, eoa));
+        fresh.setRegistry(ICrownRegistry(eoa));
+        // A contract that answers `king` but is not a CrownRegistry is refused: the owner picks an
+        // instance of the rule-based registry, never a registry of its own making.
+        address fake = address(new FakeRegistry(owner));
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(CrownHook.NotCrownRegistry.selector, fake));
+        fresh.setRegistry(ICrownRegistry(fake));
         vm.prank(owner);
         fresh.setRegistry(registry);
         vm.prank(owner);
         vm.expectRevert(CrownHook.RegistryAlreadySet.selector);
         fresh.setRegistry(registry);
+        // The alias ThroneRegistry is the same contract and is accepted too.
+        address owner2 = makeAddr("owner-2");
+        CrownHook second = HookDeployer.deploy(manager, owner2);
+        ThroneRegistry throne = new ThroneRegistry("CRWN", address(token), kingWallet);
+        vm.prank(owner2);
+        second.setRegistry(throne);
+        assertEq(address(second.registry()), address(throne));
+        assertEq(address(registry).codehash, fresh.CROWN_REGISTRY_CODEHASH());
+        assertEq(address(throne).codehash, fresh.THRONE_REGISTRY_CODEHASH());
     }
 
     function test_registerPoolFailurePaths() public {
@@ -471,10 +523,12 @@ contract CrownHookTest is Test {
         CrownHook h = HookDeployer.deploy(manager, owner);
         PoolKey memory k = PoolKey(ETH, Currency.wrap(address(token)), POOL_FEE, SPACING, IHooks(address(h)));
         manager.initialize(k, SQRT_PRICE_1_1);
+        CrownRegistry dirty = new CrownRegistry("CRWN", address(token), kingWallet);
         vm.startPrank(owner);
-        h.setRegistry(ICrownRegistry(address(new DirtyRegistry())));
+        h.setRegistry(dirty);
         h.registerPool(k, CRWN, 100);
         vm.stopPrank();
+        vm.etch(address(dirty), address(new DirtyRegistry()).code);
         lp.modify(k, TickMath.minUsableTick(SPACING), TickMath.maxUsableTick(SPACING), 1_000e18);
         vm.expectEmit(true, true, false, true);
         emit CrownHook.CutSkipped(k.toId(), CRWN, 0.01 ether, "REGISTRY_READ_FAILED");
@@ -488,19 +542,24 @@ contract CrownHookTest is Test {
         assertEq(h.crownPaid(CRWN, ETH), 0);
     }
 
-    function test_noRegistryNoCut() public {
+    /// @dev A pool cannot be bound before the registry is, and an unbound pool trades without the
+    /// cut and says so (`POOL_NOT_REGISTERED`, quoting the default cut it would have charged).
+    function test_registerPoolNeedsRegistryAndUnboundPoolSkipsTheCut() public {
         CrownHook bare = HookDeployer.deploy(manager, owner);
         PoolKey memory k = PoolKey(ETH, Currency.wrap(address(token)), POOL_FEE, SPACING, IHooks(address(bare)));
         manager.initialize(k, SQRT_PRICE_1_1);
         vm.prank(owner);
+        vm.expectRevert(CrownHook.RegistryNotSet.selector);
         bare.registerPool(k, CRWN, 100);
         lp.modify(k, TickMath.minUsableTick(SPACING), TickMath.maxUsableTick(SPACING), 1_000e18);
         uint256 before = kingWallet.balance;
         vm.expectEmit(true, true, false, true);
-        emit CrownHook.CutSkipped(k.toId(), CRWN, 0.01 ether, "NO_REGISTRY");
-        swapper.swap(k, true, 1 ether);
+        emit CrownHook.CutSkipped(k.toId(), bytes32(0), 0.01 ether, "POOL_NOT_REGISTERED");
+        BalanceDelta d = swapper.swap(k, true, 1 ether);
+        assertEq(d.amount0(), -1 ether);
         assertEq(kingWallet.balance, before);
         assertEq(bare.crownPaid(CRWN, ETH), 0);
+        _assertSettledWithoutCustody();
     }
 
     function test_unregisteredPoolNoCut() public {
@@ -519,10 +578,12 @@ contract CrownHookTest is Test {
         CrownHook h = HookDeployer.deploy(manager, owner);
         PoolKey memory k = PoolKey(ETH, Currency.wrap(address(token)), POOL_FEE, SPACING, IHooks(address(h)));
         manager.initialize(k, SQRT_PRICE_1_1);
+        CrownRegistry down = new CrownRegistry("CRWN", address(token), kingWallet);
         vm.startPrank(owner);
-        h.setRegistry(ICrownRegistry(address(new RevertingRegistry())));
+        h.setRegistry(down);
         h.registerPool(k, CRWN, 100);
         vm.stopPrank();
+        vm.etch(address(down), address(new RevertingRegistry()).code);
         lp.modify(k, TickMath.minUsableTick(SPACING), TickMath.maxUsableTick(SPACING), 1_000e18);
         vm.expectEmit(true, true, false, true);
         emit CrownHook.CutSkipped(k.toId(), CRWN, 0.01 ether, "REGISTRY_READ_FAILED");
@@ -615,17 +676,26 @@ contract CrownHookTest is Test {
         _assertSettledWithoutCustody();
     }
 
-    function test_unknownTickerNoCut() public {
+    /// @dev A pool can only be bound to a ticker whose king is the pool's own token: an uncrowned
+    /// ticker, or one somebody squatted with another token, is refused, so a front-run
+    /// `registerKing` can never route a pool's cut to an outsider.
+    function test_registerPoolRefusesTickersTheKingDoesNotOwn() public {
         PoolKey memory k = key;
         k.fee = 3_000;
         manager.initialize(k, SQRT_PRICE_1_1);
+        bytes32 noKing = keccak256("NOKING");
         vm.prank(owner);
-        hook.registerPool(k, keccak256("NOKING"), 100);
-        lp.modify(k, TickMath.minUsableTick(SPACING), TickMath.maxUsableTick(SPACING), 1_000e18);
-        vm.expectEmit(true, true, false, true);
-        emit CrownHook.CutSkipped(k.toId(), keccak256("NOKING"), 0.01 ether, "NO_KING");
-        swapper.swap(k, true, 1 ether);
-        assertEq(hook.crownPaid(keccak256("NOKING"), ETH), 0);
+        vm.expectRevert(
+            abi.encodeWithSelector(CrownHook.KingIsNotPoolToken.selector, noKing, address(0), address(token))
+        );
+        hook.registerPool(k, noKing, 100);
+        address squatted = address(0x1234);
+        registry.registerKing(noKing, squatted, makeAddr("squatter"));
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(CrownHook.KingIsNotPoolToken.selector, noKing, squatted, address(token)));
+        hook.registerPool(k, noKing, 100);
+        (, bytes32 ticker,) = hook.pools(k.toId());
+        assertEq(ticker, bytes32(0));
     }
 
     function test_beneficiaryRejectingEthNoCut() public {
@@ -683,6 +753,68 @@ contract CrownHookTest is Test {
         assertEq(d.amount0(), -1 ether);
         assertEq(kingWallet.balance - before, 0.01 ether, "the second buy pays");
         assertEq(h.crownPaid(CRWN, ETH), 0.01 ether);
+    }
+
+    /// @dev The hook must never block a swap, even for a beneficiary that re-enters the unlocked
+    /// PoolManager while being paid. Its payment is rolled back and the swap proceeds without the cut,
+    /// on both payment paths.
+    function test_hostileBeneficiaryCannotBlockSwapsAndIsNotPaid() public {
+        HostileBeneficiary bad = new HostileBeneficiary(manager);
+        vm.mockCall(
+            address(registry),
+            abi.encodeCall(ICrownRegistry.king, (CRWN)),
+            abi.encode(address(token), address(bad), uint64(1_000_000))
+        );
+        for (uint8 mode; mode < 3; mode++) {
+            bad.setMode(mode);
+            uint256 tokensBefore = token.balanceOf(address(swapper));
+            vm.expectEmit(true, true, false, true);
+            emit CrownHook.CutSkipped(poolId, CRWN, 0.01 ether, "BENEFICIARY_REJECTED");
+            swapper.swap(key, true, 1 ether); // exact-input buy: beforeSwap path
+            assertGt(token.balanceOf(address(swapper)), tokensBefore, "exact-input buy blocked");
+            uint256 ethBefore = address(swapper).balance;
+            swapper.swap(key, false, 1e18); // exact-input sell: afterSwap path
+            assertGt(address(swapper).balance, ethBefore, "exact-input sell blocked");
+            swapper.swapExact(key, true, 1e18); // exact-output buy: afterSwap path
+            swapper.swapExact(key, false, 0.5 ether); // exact-output sell: beforeSwap path
+            assertEq(address(bad).balance, 0, "the hostile beneficiary was paid");
+            assertEq(hook.crownPaid(CRWN, ETH), 0);
+            _assertSettledWithoutCustody();
+        }
+    }
+
+    /// @dev `payout` is the hook's own: nobody else can make the hook pay anyone.
+    function test_payoutRefusesEveryoneButTheHook() public {
+        vm.expectRevert(CrownHook.NotSelf.selector);
+        hook.payout(alice, 1);
+    }
+
+    /// @dev When the PoolManager holds some ETH but less than the cut, the available part is paid
+    /// rather than the whole cut being skipped.
+    function test_partialCutWhenManagerHoldsLessThanTheCut() public {
+        PoolManager fresh = new PoolManager(address(this));
+        CrownHook h = HookDeployer.deploy(fresh, owner);
+        PoolKey memory k = PoolKey(ETH, Currency.wrap(address(token)), POOL_FEE, SPACING, IHooks(address(h)));
+        fresh.initialize(k, SQRT_PRICE_1_1);
+        vm.startPrank(owner);
+        h.setRegistry(registry);
+        h.registerPool(k, CRWN, 100);
+        vm.stopPrank();
+        LiquidityProvider lp2 = new LiquidityProvider(fresh);
+        token.transfer(address(lp2), 10_000 ether);
+        lp2.modify(k, -600, -60, 1_000e18);
+        Swapper s2 = new Swapper(fresh);
+        vm.deal(address(s2), 100 ether);
+        s2.swap(k, true, 0.01 ether); // skipped: the manager holds nothing yet
+        assertEq(address(fresh).balance, 0.01 ether);
+        uint256 before = kingWallet.balance;
+        vm.expectEmit(true, true, true, true);
+        emit CrownHook.CrownPaid(k.toId(), CRWN, kingWallet, 0.01 ether);
+        BalanceDelta d = s2.swap(k, true, 5 ether); // cut 0.05 > 0.01 held: pays the 0.01
+        assertEq(d.amount0(), -5 ether);
+        assertEq(kingWallet.balance - before, 0.01 ether, "paid what the manager held");
+        assertEq(h.crownPaid(CRWN, ETH), 0.01 ether);
+        assertEq(address(fresh).balance, 5 ether, "the swap's ETH stays with the manager");
     }
 
     function test_tinySwapRoundsCutToZero() public {

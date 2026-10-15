@@ -13,6 +13,13 @@ import {ICrownRegistry} from "./interfaces/ICrownRegistry.sol";
 /// - losing side: 80% of every stake refundable, 20% slashed;
 /// - slash: half to the winning-side stakers pro-rata, half to `TREASURY`.
 /// The challenger's bond is the challenger's opening stake on the challenger side.
+///
+/// Displacement: a live challenge still in its staking window can be displaced by a new challenger
+/// bonding exactly twice its bond. The displaced challenge ends at once with every stake on both
+/// sides fully refundable (nothing slashed, no cooldown, no crown change) and the new challenge
+/// starts its own window. The challenge slot is therefore never a lock: a king, or an ally, who
+/// opens a sham challenge against itself to keep outsiders out can be displaced for 0.02 ETH, and
+/// each further round doubles the bond at stake, which a sham cannot sustain for free.
 contract CrownRegistry is ICrownRegistry {
     // ---------------------------------------------------------------- parameters
 
@@ -47,6 +54,11 @@ contract CrownRegistry is ICrownRegistry {
         uint256 challengerStake;
         /// @dev Half of the slash, split pro-rata among winning-side stakers (fixed at finalize).
         uint256 winnerBonus;
+        /// @dev The opening bond: `BOND`, or twice the bond of the challenge this one displaced.
+        uint256 bond;
+        /// @dev The challenge that displaced this one, or 0. A displaced challenge is finalized at
+        /// once with full refunds on both sides.
+        uint256 displacedBy;
     }
 
     struct TickerTotals {
@@ -84,6 +96,9 @@ contract CrownRegistry is ICrownRegistry {
         uint64 finalizeAfter
     );
     event Staked(uint256 indexed challengeId, address indexed staker, Side side, uint256 amount);
+    event ChallengeDisplaced(
+        uint256 indexed challengeId, uint256 indexed byChallengeId, bytes32 indexed ticker, uint256 bond
+    );
     event Dethroned(
         uint256 indexed challengeId,
         bytes32 indexed ticker,
@@ -156,12 +171,24 @@ contract CrownRegistry is ICrownRegistry {
         return id != 0 && !_challenges[id].finalized;
     }
 
+    /// @notice The bond `openChallenge(ticker, ...)` must send now: `BOND`, or twice the live
+    /// challenge's bond while that challenge is still in its staking window. Zero while a live
+    /// challenge is past its window (nothing can be opened until it is finalized).
+    function requiredBond(bytes32 ticker) public view returns (uint256) {
+        uint256 id = liveChallenge[ticker];
+        if (id == 0 || _challenges[id].finalized) return BOND;
+        Challenge storage live = _challenges[id];
+        return block.timestamp < live.windowEnd ? live.bond * 2 : 0;
+    }
+
     /// @notice What `staker` can still pull out of a finalized challenge.
     function claimable(uint256 challengeId, address staker) public view returns (uint256 amount) {
         Challenge storage c = _challenges[challengeId];
         if (!c.finalized || claimed[challengeId][staker]) return 0;
         uint256 kingPart = kingStakeOf[challengeId][staker];
         uint256 chalPart = challengerStakeOf[challengeId][staker];
+        // A displaced challenge refunds both sides in full.
+        if (c.displacedBy != 0) return kingPart + chalPart;
         (uint256 winStake, uint256 winTotal, uint256 loseStake) =
             c.challengerWon ? (chalPart, c.challengerStake, kingPart) : (kingPart, c.kingStake, chalPart);
         if (winStake != 0) amount += winStake + (c.winnerBonus * winStake) / winTotal;
@@ -177,15 +204,25 @@ contract CrownRegistry is ICrownRegistry {
         _crown(ticker, token, beneficiary);
     }
 
-    /// @notice Open a challenge against the king of `ticker` with a `BOND` ETH opening stake.
-    /// The caller becomes the beneficiary of `challengerToken` if the challenge succeeds.
+    /// @notice Open a challenge against the king of `ticker` with an opening stake of `requiredBond(ticker)`:
+    /// `BOND`, or exactly twice the live challenge's bond to displace it while it is still in its
+    /// staking window (see `ChallengeDisplaced`). The caller becomes the beneficiary of
+    /// `challengerToken` if the challenge succeeds.
     function openChallenge(bytes32 ticker, address challengerToken) external payable returns (uint256 challengeId) {
         King storage k = _kings[ticker];
         if (k.token == address(0)) revert NotCrowned(ticker);
         if (challengerToken == address(0)) revert ZeroAddress();
         if (challengerToken == k.token) revert SameToken();
-        if (msg.value != BOND) revert WrongBond(msg.value, BOND);
-        if (hasLiveChallenge(ticker)) revert ChallengeLive(ticker, liveChallenge[ticker]);
+        uint256 required = BOND;
+        uint256 displaced = liveChallenge[ticker];
+        if (displaced != 0 && !_challenges[displaced].finalized) {
+            // Past its window the live challenge is being decided: nothing can displace it.
+            if (block.timestamp >= _challenges[displaced].windowEnd) revert ChallengeLive(ticker, displaced);
+            required = _challenges[displaced].bond * 2;
+        } else {
+            displaced = 0;
+        }
+        if (msg.value != required) revert WrongBond(msg.value, required);
         uint64 challengeableAt = k.reignStartedAt + MIN_REIGN;
         if (block.timestamp < challengeableAt) revert ReignTooYoung(challengeableAt);
         if (block.timestamp < cooldownUntil[ticker]) revert InCooldown(cooldownUntil[ticker]);
@@ -199,9 +236,17 @@ contract CrownRegistry is ICrownRegistry {
         c.openedAt = uint64(block.timestamp);
         c.windowEnd = windowEnd;
         c.finalizeAfter = windowEnd + TIMELOCK;
+        c.bond = msg.value;
         liveChallenge[ticker] = challengeId;
         tickerTotals[ticker].challengesOpened += 1;
 
+        if (displaced != 0) {
+            // Ends at once: both sides fully refundable through `claim`, no slash, no cooldown.
+            Challenge storage old = _challenges[displaced];
+            old.finalized = true;
+            old.displacedBy = challengeId;
+            emit ChallengeDisplaced(displaced, challengeId, ticker, msg.value);
+        }
         emit ChallengeOpened(challengeId, ticker, challengerToken, msg.sender, windowEnd, c.finalizeAfter);
         _stake(challengeId, c, Side.Challenger, msg.value);
     }
@@ -212,6 +257,7 @@ contract CrownRegistry is ICrownRegistry {
         if (c.openedAt == 0) revert UnknownChallenge(challengeId);
         if (msg.value == 0) revert ZeroStake();
         if (block.timestamp >= c.windowEnd) revert WindowClosed(c.windowEnd);
+        if (c.finalized) revert AlreadyFinalized(challengeId); // displaced inside its window
         _stake(challengeId, c, side, msg.value);
     }
 

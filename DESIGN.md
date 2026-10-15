@@ -66,7 +66,7 @@ Panels use the 16-pixel `--radius`. Inputs and buttons use eight-pixel corners; 
 | `ui.tsx: Modal` | Native dialog with Escape/backdrop/close control, explicit Tab boundary wrapping, focus restoration and scroll lock. |
 | `ui.tsx: AddressView` | Full checksummed explorer link, copy button and temporary “Copied” label; no clipped address. |
 | `Wallet.tsx` | EIP-6963 wallet list, smart wallet, phone deep links, per-row opening state, rejection recovery, account/disconnect dialog and network switching. |
-| `ChallengePanel.tsx` | Candidate field or live stake form; radio side choice, amounts, quorum, phase countdown and finalize control. Field errors are associated with inputs and receive focus. |
+| `ChallengePanel.tsx` | Candidate field or live stake form; radio side choice, amounts, quorum, phase countdown and finalize control. Field errors are associated with inputs and receive focus. During the staking window the same candidate form is offered under a native `details.displace-details` disclosure ("Displace this challenge") with the registry's required bond, a top hairline (`--line`) and 12-pixel top margin, so the secondary action never competes with staking. |
 | `Transaction.tsx` | Frozen review, simulated request, fresh wallet-client/chain checks, per-button pending state, receipt/replacement errors and explorer link. |
 | `TransactionFeed.tsx` | Persistent transaction result when the originating form changes phase. Dismissible after settlement; does not overlay content. |
 | `History.tsx` | Current reign plus paginated event timeline, explicit block coverage, loading/error/retry states. |

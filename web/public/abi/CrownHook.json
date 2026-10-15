@@ -30,6 +30,19 @@
   },
   {
     "type": "function",
+    "name": "CROWN_REGISTRY_CODEHASH",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "DEFAULT_CUT_BPS",
     "inputs": [],
     "outputs": [
@@ -76,6 +89,19 @@
         "name": "",
         "type": "uint256",
         "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "THRONE_REGISTRY_CODEHASH",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
       }
     ],
     "stateMutability": "view"
@@ -991,6 +1017,24 @@
   },
   {
     "type": "function",
+    "name": "payout",
+    "inputs": [
+      {
+        "name": "beneficiary",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "cut",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "poolManager",
     "inputs": [],
     "outputs": [
@@ -1380,6 +1424,38 @@
   },
   {
     "type": "error",
+    "name": "KingIsNotPoolToken",
+    "inputs": [
+      {
+        "name": "ticker",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "king",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "poolToken",
+        "type": "address",
+        "internalType": "address"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "NotCrownRegistry",
+    "inputs": [
+      {
+        "name": "candidate",
+        "type": "address",
+        "internalType": "address"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "NotNativePool",
     "inputs": []
   },
@@ -1422,6 +1498,11 @@
   },
   {
     "type": "error",
+    "name": "PayoutLeftTraces",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "PoolAlreadyRegistered",
     "inputs": []
   },
@@ -1433,6 +1514,11 @@
   {
     "type": "error",
     "name": "RegistryAlreadySet",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "RegistryNotSet",
     "inputs": []
   },
   {
