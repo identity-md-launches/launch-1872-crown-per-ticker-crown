@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CROWN — ticker page</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { max-width: 860px; margin: 2rem auto; padding: 0 1rem; line-height: 1.45; }
+  h1 { margin-bottom: 0; } .muted { opacity: .7; }
+  section { border: 1px solid #8884; border-radius: 10px; padding: 1rem 1.2rem; margin: 1rem 0; }
+  table { border-collapse: collapse; width: 100%; } td { padding: .25rem .4rem; border-bottom: 1px solid #8882; }
+  td:first-child { opacity: .7; width: 40%; }
+  input, select, button { font: inherit; padding: .4rem .6rem; margin: .2rem 0; }
+  input[type=text] { width: 100%; box-sizing: border-box; }
+  button { cursor: pointer; } .row { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; }
+  code { font-size: .92em; } #log { white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: .85em; }
+</style>
+</head>
+<body>
+<h1>👑 CROWN</h1>
+<p class="muted">One canonical token per ticker. Every swap on a crowned pool pays its king, at the source.</p>
+
+<section>
+  <h2>Setup</h2>
+  <p class="muted">Fill these once after launch (Robinhood Chain, chain id 4663). They are also the constants at the top of this file's script.</p>
+  <label>RPC URL <input type="text" id="rpc"></label>
+  <label>CrownRegistry <input type="text" id="registry"></label>
+  <label>CrownHook <input type="text" id="hook"></label>
+  <div class="row"><label>Ticker <input type="text" id="symbol" value="CRWN" style="width:8rem"></label>
+    <button id="load">Load</button> <button id="connect">Connect wallet</button> <span id="account" class="muted"></span></div>
+</section>
+
+<section>
+  <h2>Current king</h2>
+  <table id="king"><tr><td>ticker id</td><td>—</td></tr><tr><td>king token</td><td>—</td></tr>
+    <tr><td>beneficiary</td><td>—</td></tr><tr><td>reign started</td><td>—</td></tr>
+    <tr><td>crownPaid (ETH)</td><td>—</td></tr><tr><td>challenges / dethronements</td><td>—</td></tr>
+    <tr><td>ETH ever staked (king / challenger)</td><td>—</td></tr><tr><td>cooldown until</td><td>—</td></tr></table>
+</section>
+
+<section>
+  <h2>Live challenge</h2>
+  <table id="challenge"><tr><td>status</td><td>—</td></tr></table>
+  <div class="row">
+    <label>Stake (ETH) <input type="text" id="stakeAmount" value="0.01" style="width:7rem"></label>
+    <select id="side"><option value="0">for the king</option><option value="1">for the challenger</option></select>
+    <button id="stake">Stake</button> <button id="finalize">Finalize</button> <button id="claim">Claim my payout</button>
+  </div>
+  <h3>Open a challenge</h3>
+  <div class="row"><label>Challenger token <input type="text" id="challengerToken" style="width:28rem"></label>
+    <button id="open">Open challenge (bond 0.01 ETH)</button></div>
+</section>
+
+<section>
+  <h2>How it works</h2>
+  <ol>
+    <li><b>One king per ticker.</b> The registry records which token is the canonical one for a symbol and which wallet gets paid for it.</li>
+    <li><b>Swaps pay the king.</b> Pools wearing the Crown hook take a small cut of the ETH side of every trade (1% on the demo pool, never more than 5%) and send it to the king's wallet in the same transaction. Nothing is held by the hook; if it cannot pay, the trade still goes through without the cut.</li>
+    <li><b>Anyone can challenge.</b> After a king has reigned 7 days, anyone can name a rival token and post a 0.01 ETH bond. That opens a 72-hour window where anyone can stake ETH for the king or for the challenger.</li>
+    <li><b>Then a 24-hour timelock.</b> After it, anyone can finalize. The challenger wins only if its side staked more than the king's side <i>and</i> at least 0.05 ETH was staked in total.</li>
+    <li><b>Winners and losers.</b> Winning stakers get all their ETH back plus a share of the loser's slash. Losers get 80% back; 20% is slashed, half to the winners and half to the treasury. Everyone withdraws their own money with "Claim".</li>
+    <li><b>Failed challenge.</b> The ticker cannot be challenged again for 3 days.</li>
+  </ol>
+</section>
+
+<section><h2>Log</h2><div id="log"></div></section>
+
+<script type="module">
+import { ethers } from "https://cdn.jsdelivr.net/npm/ethers@6.13.4/dist/ethers.min.js";
+
+// ---- fill after launch -----------------------------------------------------
+const DEFAULTS = { rpc: "", registry: "", hook: "" };
+// ---------------------------------------------------------------------------
+
+const REGISTRY_ABI = [
+  "function tickerOf(string) pure returns (bytes32)",
+  "function king(bytes32) view returns (tuple(address token,address beneficiary,uint64 reignStartedAt))",
+  "function liveChallenge(bytes32) view returns (uint256)",
+  "function cooldownUntil(bytes32) view returns (uint64)",
+  "function tickerTotals(bytes32) view returns (uint256 challengesOpened,uint256 dethronements,uint256 kingStakedEver,uint256 challengerStakedEver)",
+  "function challenges(uint256) view returns (tuple(bytes32 ticker,address challengerToken,address challengerBeneficiary,uint64 openedAt,uint64 windowEnd,uint64 finalizeAfter,bool finalized,bool challengerWon,uint256 kingStake,uint256 challengerStake,uint256 winnerBonus))",
+  "function claimable(uint256,address) view returns (uint256)",
+  "function challengeCount() view returns (uint256)",
+  "function BOND() view returns (uint256)",
+  "function openChallenge(bytes32,address) payable returns (uint256)",
+  "function stake(uint256,uint8) payable",
+  "function finalize(uint256)",
+  "function claim(uint256)",
+];
+const HOOK_ABI = ["function crownPaid(bytes32,address) view returns (uint256)"];
+
+const $ = (id) => document.getElementById(id);
+for (const k of ["rpc", "registry", "hook"]) $(k).value = DEFAULTS[k];
+const log = (m) => { $("log").textContent = `${new Date().toLocaleTimeString()}  ${m}\n` + $("log").textContent; };
+const fmt = (wei) => `${ethers.formatEther(wei)} ETH`;
+const when = (t) => Number(t) ? new Date(Number(t) * 1000).toLocaleString() : "—";
+const left = (t) => { const s = Number(t) - Math.floor(Date.now() / 1000); if (s <= 0) return "passed";
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m remaining`; };
+
+let provider, signer, registry, hook, ticker, liveId = 0n;
+
+function reader() {
+  provider = new ethers.JsonRpcProvider($("rpc").value);
+  registry = new ethers.Contract($("registry").value, REGISTRY_ABI, provider);
+  hook = $("hook").value ? new ethers.Contract($("hook").value, HOOK_ABI, provider) : null;
+}
+
+async function load() {
+  try {
+    reader();
+    ticker = await registry.tickerOf($("symbol").value);
+    const [k, totals, cooldown, paid] = await Promise.all([
+      registry.king(ticker), registry.tickerTotals(ticker), registry.cooldownUntil(ticker),
+      hook ? hook.crownPaid(ticker, ethers.ZeroAddress) : 0n,
+    ]);
+    const rows = $("king").rows;
+    rows[0].cells[1].textContent = ticker;
+    rows[1].cells[1].textContent = k.token === ethers.ZeroAddress ? "not crowned" : k.token;
+    rows[2].cells[1].textContent = k.beneficiary;
+    rows[3].cells[1].textContent = when(k.reignStartedAt);
+    rows[4].cells[1].textContent = hook ? fmt(paid) : "(hook address not set)";
+    rows[5].cells[1].textContent = `${totals.challengesOpened} / ${totals.dethronements}`;
+    rows[6].cells[1].textContent = `${fmt(totals.kingStakedEver)} / ${fmt(totals.challengerStakedEver)}`;
+    rows[7].cells[1].textContent = Number(cooldown) > Date.now() / 1000 ? when(cooldown) : "none";
+
+    liveId = await registry.liveChallenge(ticker);
+    const t = $("challenge");
+    if (liveId === 0n) {
+      const total = await registry.challengeCount();
+      // Show the most recent finalized challenge of this ticker, if any, so claims stay reachable.
+      let last = null;
+      for (let i = total; i >= 1n && i > total - 20n; i--) { const c = await registry.challenges(i); if (c.ticker === ticker) { last = [i, c]; break; } }
+      t.innerHTML = last
+        ? `<tr><td>status</td><td>no live challenge; last challenge #${last[0]} ${last[1].challengerWon ? "dethroned the king" : "failed"}</td></tr>`
+          + `<tr><td>final stakes (king / challenger)</td><td>${fmt(last[1].kingStake)} / ${fmt(last[1].challengerStake)}</td></tr>`
+        : `<tr><td>status</td><td>no live challenge</td></tr>`;
+      if (last) liveId = last[0];
+      return;
+    }
+    const c = await registry.challenges(liveId);
+    const now = Math.floor(Date.now() / 1000);
+    const phase = now < Number(c.windowEnd) ? "staking window open" : now < Number(c.finalizeAfter) ? "timelock" : "ready to finalize";
+    const total = c.kingStake + c.challengerStake;
+    const leading = c.challengerStake > c.kingStake && total >= ethers.parseEther("0.05") ? "challenger would win" : "king would hold";
+    t.innerHTML = [
+      ["status", `#${liveId}: ${phase} (${leading})`],
+      ["challenger token", c.challengerToken], ["challenger beneficiary", c.challengerBeneficiary],
+      ["opened", when(c.openedAt)], ["window ends", `${when(c.windowEnd)} — ${left(c.windowEnd)}`],
+      ["finalizable after", `${when(c.finalizeAfter)} — ${left(c.finalizeAfter)}`],
+      ["king stake", fmt(c.kingStake)], ["challenger stake", fmt(c.challengerStake)],
+      ["total / quorum", `${fmt(total)} / 0.05 ETH`],
+    ].map(([a, b]) => `<tr><td>${a}</td><td>${b}</td></tr>`).join("");
+    log(`loaded ${$("symbol").value}`);
+  } catch (e) { log(`load failed: ${e.shortMessage || e.message}`); }
+}
+
+async function connect() {
+  if (!window.ethereum) return log("no injected wallet");
+  const bp = new ethers.BrowserProvider(window.ethereum);
+  await bp.send("eth_requestAccounts", []);
+  signer = await bp.getSigner();
+  $("account").textContent = await signer.getAddress();
+  log("wallet connected");
+}
+
+async function send(label, fn) {
+  if (!signer) return log("connect a wallet first");
+  try { const tx = await fn(registry.connect(signer)); log(`${label}: ${tx.hash}`); await tx.wait(); log(`${label} confirmed`); await load(); }
+  catch (e) { log(`${label} failed: ${e.shortMessage || e.message}`); }
+}
+
+$("load").onclick = load;
+$("connect").onclick = connect;
+$("open").onclick = () => send("openChallenge", async (r) => r.openChallenge(ticker, $("challengerToken").value, { value: await r.BOND() }));
+$("stake").onclick = () => send("stake", (r) => r.stake(liveId, Number($("side").value), { value: ethers.parseEther($("stakeAmount").value) }));
+$("finalize").onclick = () => send("finalize", (r) => r.finalize(liveId));
+$("claim").onclick = () => send("claim", (r) => r.claim(liveId));
+if (DEFAULTS.rpc && DEFAULTS.registry) load();
+</script>
+</body>
+</html>

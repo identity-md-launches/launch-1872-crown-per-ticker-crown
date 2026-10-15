@@ -1,0 +1,4 @@
+v4-core 46c6834698c48bc4a463a86d8420f4eb1d7f3b75
+forge-std 0258fe875e1d8e207c1eb7175e542ea32356773c
+openzeppelin-contracts v5.1.0
+solmate 89365b880c4f3c786bdd453d4b8e8fe410344a69 (Owned.sol only)
